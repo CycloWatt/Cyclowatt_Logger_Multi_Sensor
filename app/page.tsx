@@ -118,8 +118,8 @@ export default function BluetoothDataLogger() {
   const streamingCharacteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null)
 
   // CycloWatt specific UUIDs
-  const CYCLOWATT_SERVICE_UUID = "006e4000-01b5-a3f3-93e0-a9e50e24dcca"
-  const CYCLOWATT_DATA_CHAR_UUID = "006e4000-02b5-a3f3-93e0-a9e50e24dcca"
+  const CYCLOWATT_SERVICE_UUID = "5a1d0001-c7a1-4b2e-9e4f-1a2b3c4d5e6f"
+  const CYCLOWATT_DATA_CHAR_UUID = "5a1d0002-c7a1-4b2e-9e4f-1a2b3c4d5e6f"
 
   // Standard Cycling Power Service (CPS) UUIDs
   const CPS_SERVICE_UUID = "00001818-0000-1000-8000-00805f9b34fb" // cycling_power
