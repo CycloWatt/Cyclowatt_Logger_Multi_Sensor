@@ -11,6 +11,8 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
 import type { RequestDeviceOptions } from "web-bluetooth"
+import { SMP_SERVICE_UUID } from "@/lib/smp/client"
+import { DfuCard } from "@/components/dfu-card"
 
 interface DataPoint {
   timestamp: number
@@ -71,6 +73,10 @@ export default function BluetoothDataLogger() {
   const [availableDevices, setAvailableDevices] = useState<AvailableDevice[]>([])
   const [isScanning, setIsScanning] = useState(false)
   const [useUuidFilter, setUseUuidFilter] = useState(false)
+  // "normal" = raw-stream logging session; "dfu" = firmware-update-only session.
+  // DFU-only mode exists because prod images don't advertise the raw-stream service
+  // (decision D1) — without it, a board flashed to prod could never be reached again.
+  const [connectionMode, setConnectionMode] = useState<"normal" | "dfu">("normal")
 
   const [serialPort, setSerialPort] = useState<SerialPort | null>(null)
   const [isSerialConnected, setIsSerialConnected] = useState(false)
@@ -455,14 +461,17 @@ export default function BluetoothDataLogger() {
       console.log("Target Service UUID:", CYCLOWATT_SERVICE_UUID)
       console.log("UUID Filtering:", useUuidFilter ? "ENABLED" : "DISABLED")
 
+      // Chrome only lets a page talk to services declared at requestDevice time —
+      // the SMP (DFU) service must be in optionalServices on EVERY connect path or
+      // the DFU card can't reach it later (decision D1).
       const requestOptions: RequestDeviceOptions = useUuidFilter
         ? {
             filters: [{ services: [CYCLOWATT_SERVICE_UUID] }],
-            optionalServices: ["generic_access", "generic_attribute"],
+            optionalServices: [SMP_SERVICE_UUID, "generic_access", "generic_attribute"],
           }
         : {
             acceptAllDevices: true,
-            optionalServices: [CYCLOWATT_SERVICE_UUID, "generic_access", "generic_attribute"],
+            optionalServices: [CYCLOWATT_SERVICE_UUID, SMP_SERVICE_UUID, "generic_access", "generic_attribute"],
           }
 
       const device = await navigator.bluetooth.requestDevice(requestOptions)
@@ -580,6 +589,7 @@ export default function BluetoothDataLogger() {
       setService(cycloWattService)
       setCharacteristic(dataCharacteristic)
       setIsConnected(true)
+      setConnectionMode("normal")
 
       device.addEventListener("gattserverdisconnected", handleDisconnection)
 
@@ -601,6 +611,11 @@ export default function BluetoothDataLogger() {
     setDevice(null)
     setService(null)
     setCharacteristic(null)
+    // Any disconnect ends the session's mode. Without this, a DFU-only session
+    // would leave the logging UI hidden until a successful raw-stream connect —
+    // which a freshly-flashed prod image (no raw-stream service) can never provide.
+    // The DFU card is unaffected: it stays mounted and keeps its own device ref.
+    setConnectionMode("normal")
   }
 
   const disconnect = async () => {
@@ -611,6 +626,33 @@ export default function BluetoothDataLogger() {
       handleDisconnection()
     } catch (err) {
       setError(`Disconnect error: ${err instanceof Error ? err.message : "Unknown error"}`)
+    }
+  }
+
+  // DFU-only connect mode (decision D1). Prod images don't advertise the raw-stream
+  // service, and the SMP service isn't in ANY variant's advertising payload (Chrome
+  // chooser filters match advertised data only) — so the chooser filters on the
+  // device-name PREFIXES the firmware uses: "Cyclowatt"* for prod images and
+  // "CycloRaw"* for DAQ images. Names carry a " v<version>" suffix (e.g.
+  // "Cyclowatt L v0.1.1"); the DAQ scan response may truncate it, but the base
+  // prefix always survives, so namePrefix matching is unaffected.
+  const connectDfuOnly = async () => {
+    try {
+      setError("")
+      console.log("\n🔧 CONNECTING IN DFU-ONLY MODE...")
+      const dfuDevice = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: "Cyclowatt" }, { namePrefix: "CycloRaw" }],
+        optionalServices: [SMP_SERVICE_UUID, CYCLOWATT_SERVICE_UUID, "generic_access", "generic_attribute"],
+      })
+      await dfuDevice.gatt!.connect()
+      console.log(`✅ DFU-only connection to: ${dfuDevice.name || "Unknown"} (${dfuDevice.id})`)
+      setDevice(dfuDevice)
+      setIsConnected(true)
+      setConnectionMode("dfu")
+      dfuDevice.addEventListener("gattserverdisconnected", handleDisconnection)
+    } catch (err) {
+      console.error("DFU-only connection failed:", err)
+      setError(`DFU connect failed: ${err instanceof Error ? err.message : "Unknown error"}`)
     }
   }
 
@@ -933,70 +975,74 @@ export default function BluetoothDataLogger() {
           </Alert>
         )}
 
-        <Card className="bg-white border-gray-200">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Cable className="w-5 h-5" />
-              Serial Synchronization Input
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="flex gap-2 items-center">
-              {!isSerialConnected ? (
-                <Button onClick={connectSerial} disabled={!serialSupported || !isSecureContext} variant="outline">
-                  Connect Serial Port
-                </Button>
-              ) : (
-                <Button onClick={disconnectSerial} variant="outline">
-                  Disconnect Serial
-                </Button>
-              )}
-              {isSerialConnected && (
-                <div className="text-sm text-gray-600 p-3 bg-purple-50 border border-purple-200 rounded-lg">
-                  <div className="font-medium">Serial Port Connected</div>
-                  <div>Latest Value: {latestSerialValue}</div>
-                  <div className="text-xs text-gray-500 mt-1">This value is logged with each Bluetooth data packet</div>
-                </div>
-              )}
-            </div>
-          </CardContent>
-        </Card>
+        {connectionMode === "normal" && (
+          <Card className="bg-white border-gray-200">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Cable className="w-5 h-5" />
+                Serial Synchronization Input
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex gap-2 items-center">
+                {!isSerialConnected ? (
+                  <Button onClick={connectSerial} disabled={!serialSupported || !isSecureContext} variant="outline">
+                    Connect Serial Port
+                  </Button>
+                ) : (
+                  <Button onClick={disconnectSerial} variant="outline">
+                    Disconnect Serial
+                  </Button>
+                )}
+                {isSerialConnected && (
+                  <div className="text-sm text-gray-600 p-3 bg-purple-50 border border-purple-200 rounded-lg">
+                    <div className="font-medium">Serial Port Connected</div>
+                    <div>Latest Value: {latestSerialValue}</div>
+                    <div className="text-xs text-gray-500 mt-1">This value is logged with each Bluetooth data packet</div>
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Reference Power Meter */}
-        <Card className="bg-white border-gray-200">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Wifi className="w-5 h-5" />
-              Reference Power Meter (Cycling Power Service)
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="flex gap-2 items-center flex-wrap">
-              {!isRefConnected ? (
-                <Button
-                  onClick={connectReferencePowerMeter}
-                  disabled={!bluetoothSupported || !isSecureContext || isRefConnecting}
-                  variant="outline"
-                >
-                  {isRefConnecting ? "Connecting..." : "Connect Reference Power Meter"}
-                </Button>
-              ) : (
-                <Button onClick={disconnectReferencePowerMeter} variant="outline">
-                  Disconnect Reference Meter
-                </Button>
-              )}
-              {isRefConnected && (
-                <div className="text-sm text-gray-600 p-3 bg-sky-50 border border-sky-200 rounded-lg">
-                  <div className="font-medium">{refDevice?.name || "Reference Power Meter"} Connected</div>
-                  <div>Latest Power: {latestRefPower} W</div>
-                  <div className="text-xs text-gray-500 mt-1">
-                    Logged with each packet and shown on the Power chart in blue
+        {connectionMode === "normal" && (
+          <Card className="bg-white border-gray-200">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Wifi className="w-5 h-5" />
+                Reference Power Meter (Cycling Power Service)
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex gap-2 items-center flex-wrap">
+                {!isRefConnected ? (
+                  <Button
+                    onClick={connectReferencePowerMeter}
+                    disabled={!bluetoothSupported || !isSecureContext || isRefConnecting}
+                    variant="outline"
+                  >
+                    {isRefConnecting ? "Connecting..." : "Connect Reference Power Meter"}
+                  </Button>
+                ) : (
+                  <Button onClick={disconnectReferencePowerMeter} variant="outline">
+                    Disconnect Reference Meter
+                  </Button>
+                )}
+                {isRefConnected && (
+                  <div className="text-sm text-gray-600 p-3 bg-sky-50 border border-sky-200 rounded-lg">
+                    <div className="font-medium">{refDevice?.name || "Reference Power Meter"} Connected</div>
+                    <div>Latest Power: {latestRefPower} W</div>
+                    <div className="text-xs text-gray-500 mt-1">
+                      Logged with each packet and shown on the Power chart in blue
+                    </div>
                   </div>
-                </div>
-              )}
-            </div>
-          </CardContent>
-        </Card>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Device Discovery */}
         <Card className="bg-white border-gray-200">
@@ -1031,6 +1077,13 @@ export default function BluetoothDataLogger() {
               >
                 {isScanning ? "Scanning..." : "Scan for Devices"}
               </Button>
+              <Button
+                variant="outline"
+                onClick={connectDfuOnly}
+                disabled={!bluetoothSupported || !isSecureContext || isConnected}
+              >
+                Connect for Firmware Update
+              </Button>
               {isConnected && (
                 <Button variant="outline" onClick={disconnect}>
                   Disconnect
@@ -1038,7 +1091,7 @@ export default function BluetoothDataLogger() {
               )}
             </div>
 
-            {isConnected && (
+            {isConnected && connectionMode === "normal" && (
               <div className="flex gap-2 flex-wrap">
                 {!isStreaming ? (
                   <Button onClick={() => startDataStreaming()} variant="default">
@@ -1098,424 +1151,434 @@ export default function BluetoothDataLogger() {
           </CardContent>
         </Card>
 
+        {/* Firmware update — kept permanently mounted so an in-flight flow (upload,
+            resume, post-reset reconnect) survives the page's isConnected flapping. */}
+        <DfuCard device={device} isStreaming={isStreaming} stopStreaming={stopDataStreaming} />
+
         {/* Statistics */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <Card className="bg-white border-gray-200">
-            <CardContent className="pt-6">
-              <div className="text-2xl font-bold">{stats.totalSamples.toLocaleString()}</div>
-              <p className="text-xs text-gray-600">Total Samples</p>
-            </CardContent>
-          </Card>
-          <Card className="bg-white border-gray-200">
-            <CardContent className="pt-6">
-              <div className="text-2xl font-bold">{stats.samplingRate.toFixed(1)} Hz</div>
-              <p className="text-xs text-gray-600">Sampling Rate</p>
-            </CardContent>
-          </Card>
-          <Card className="bg-white border-gray-200">
-            <CardContent className="pt-6">
-              <div className="text-2xl font-bold">{stats.packetsPerSecond.toFixed(1)} pps</div>
-              <p className="text-xs text-gray-600">Packets/Second</p>
-            </CardContent>
-          </Card>
-          <Card className="bg-white border-gray-200">
-            <CardContent className="pt-6">
-              <div className="text-2xl font-bold">{stats.duration.toFixed(1)}s</div>
-              <p className="text-xs text-gray-600">Duration</p>
-            </CardContent>
-          </Card>
-        </div>
+        {connectionMode === "normal" && (
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <Card className="bg-white border-gray-200">
+              <CardContent className="pt-6">
+                <div className="text-2xl font-bold">{stats.totalSamples.toLocaleString()}</div>
+                <p className="text-xs text-gray-600">Total Samples</p>
+              </CardContent>
+            </Card>
+            <Card className="bg-white border-gray-200">
+              <CardContent className="pt-6">
+                <div className="text-2xl font-bold">{stats.samplingRate.toFixed(1)} Hz</div>
+                <p className="text-xs text-gray-600">Sampling Rate</p>
+              </CardContent>
+            </Card>
+            <Card className="bg-white border-gray-200">
+              <CardContent className="pt-6">
+                <div className="text-2xl font-bold">{stats.packetsPerSecond.toFixed(1)} pps</div>
+                <p className="text-xs text-gray-600">Packets/Second</p>
+              </CardContent>
+            </Card>
+            <Card className="bg-white border-gray-200">
+              <CardContent className="pt-6">
+                <div className="text-2xl font-bold">{stats.duration.toFixed(1)}s</div>
+                <p className="text-xs text-gray-600">Duration</p>
+              </CardContent>
+            </Card>
+          </div>
+        )}
 
         {/* Charts */}
-        <div className="grid grid-cols-1 gap-6">
-          {/* Compression Force Chart */}
-          <Card className="bg-white border-gray-200">
-            <CardHeader className="flex flex-row items-center justify-between">
-              <CardTitle>Compression Force (Channels 0, 2, 4)</CardTitle>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={resetCompressionZoom}
-                disabled={!compressionZoom.startIndex && !compressionZoom.endIndex}
-              >
-                Reset Zoom
-              </Button>
-            </CardHeader>
-            <CardContent className="p-2">
-              <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis
-                      dataKey="time"
-                      tick={false}
-                      axisLine={false}
-                      domain={["dataMin", "dataMax"]}
-                      type="category"
-                    />
-                    <YAxis tick={{ fontSize: 10 }} width={60} />
-                    <ChartTooltip content={<ChartTooltipContent />} />
-                    <Line
-                      type="monotone"
-                      dataKey="force0"
-                      stroke="var(--color-force0)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Channel 0"
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="force2"
-                      stroke="var(--color-force2)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Channel 2"
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="force4"
-                      stroke="var(--color-force4)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Channel 4"
-                      isAnimationActive={false}
-                    />
-                    <Brush
-                      dataKey="time"
-                      height={30}
-                      stroke="var(--color-force0)"
-                      startIndex={compressionZoom.startIndex}
-                      endIndex={compressionZoom.endIndex}
-                      onChange={(brushData) => {
-                        if (brushData) {
-                          setCompressionZoom({
-                            startIndex: brushData.startIndex,
-                            endIndex: brushData.endIndex,
-                          })
-                        }
-                      }}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </ChartContainer>
-            </CardContent>
-          </Card>
+        {connectionMode === "normal" && (
+          <div className="grid grid-cols-1 gap-6">
+            {/* Compression Force Chart */}
+            <Card className="bg-white border-gray-200">
+              <CardHeader className="flex flex-row items-center justify-between">
+                <CardTitle>Compression Force (Channels 0, 2, 4)</CardTitle>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={resetCompressionZoom}
+                  disabled={!compressionZoom.startIndex && !compressionZoom.endIndex}
+                >
+                  Reset Zoom
+                </Button>
+              </CardHeader>
+              <CardContent className="p-2">
+                <ChartContainer config={chartConfig} className="h-[400px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                      <XAxis
+                        dataKey="time"
+                        tick={false}
+                        axisLine={false}
+                        domain={["dataMin", "dataMax"]}
+                        type="category"
+                      />
+                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <ChartTooltip content={<ChartTooltipContent />} />
+                      <Line
+                        type="monotone"
+                        dataKey="force0"
+                        stroke="var(--color-force0)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Channel 0"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="force2"
+                        stroke="var(--color-force2)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Channel 2"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="force4"
+                        stroke="var(--color-force4)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Channel 4"
+                        isAnimationActive={false}
+                      />
+                      <Brush
+                        dataKey="time"
+                        height={30}
+                        stroke="var(--color-force0)"
+                        startIndex={compressionZoom.startIndex}
+                        endIndex={compressionZoom.endIndex}
+                        onChange={(brushData) => {
+                          if (brushData) {
+                            setCompressionZoom({
+                              startIndex: brushData.startIndex,
+                              endIndex: brushData.endIndex,
+                            })
+                          }
+                        }}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartContainer>
+              </CardContent>
+            </Card>
 
-          {/* Shear Force Chart */}
-          <Card className="bg-white border-gray-200">
-            <CardHeader className="flex flex-row items-center justify-between">
-              <CardTitle>Shear Force (Channels 1, 3, 5)</CardTitle>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={resetShearZoom}
-                disabled={!shearZoom.startIndex && !shearZoom.endIndex}
-              >
-                Reset Zoom
-              </Button>
-            </CardHeader>
-            <CardContent className="p-2">
-              <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis
-                      dataKey="time"
-                      tick={false}
-                      axisLine={false}
-                      domain={["dataMin", "dataMax"]}
-                      type="category"
-                    />
-                    <YAxis tick={{ fontSize: 10 }} width={60} />
-                    <ChartTooltip content={<ChartTooltipContent />} />
-                    <Line
-                      type="monotone"
-                      dataKey="force1"
-                      stroke="var(--color-force1)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Channel 1"
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="force3"
-                      stroke="var(--color-force3)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Channel 3"
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="force5"
-                      stroke="var(--color-force5)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Channel 5"
-                      isAnimationActive={false}
-                    />
-                    <Brush
-                      dataKey="time"
-                      height={30}
-                      stroke="var(--color-force1)"
-                      startIndex={shearZoom.startIndex}
-                      endIndex={shearZoom.endIndex}
-                      onChange={(brushData) => {
-                        if (brushData) {
-                          setShearZoom({
-                            startIndex: brushData.startIndex,
-                            endIndex: brushData.endIndex,
-                          })
-                        }
-                      }}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </ChartContainer>
-            </CardContent>
-          </Card>
+            {/* Shear Force Chart */}
+            <Card className="bg-white border-gray-200">
+              <CardHeader className="flex flex-row items-center justify-between">
+                <CardTitle>Shear Force (Channels 1, 3, 5)</CardTitle>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={resetShearZoom}
+                  disabled={!shearZoom.startIndex && !shearZoom.endIndex}
+                >
+                  Reset Zoom
+                </Button>
+              </CardHeader>
+              <CardContent className="p-2">
+                <ChartContainer config={chartConfig} className="h-[400px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                      <XAxis
+                        dataKey="time"
+                        tick={false}
+                        axisLine={false}
+                        domain={["dataMin", "dataMax"]}
+                        type="category"
+                      />
+                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <ChartTooltip content={<ChartTooltipContent />} />
+                      <Line
+                        type="monotone"
+                        dataKey="force1"
+                        stroke="var(--color-force1)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Channel 1"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="force3"
+                        stroke="var(--color-force3)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Channel 3"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="force5"
+                        stroke="var(--color-force5)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Channel 5"
+                        isAnimationActive={false}
+                      />
+                      <Brush
+                        dataKey="time"
+                        height={30}
+                        stroke="var(--color-force1)"
+                        startIndex={shearZoom.startIndex}
+                        endIndex={shearZoom.endIndex}
+                        onChange={(brushData) => {
+                          if (brushData) {
+                            setShearZoom({
+                              startIndex: brushData.startIndex,
+                              endIndex: brushData.endIndex,
+                            })
+                          }
+                        }}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartContainer>
+              </CardContent>
+            </Card>
 
-          {/* Acceleration Chart */}
-          <Card className="bg-white border-gray-200">
-            <CardHeader className="flex flex-row items-center justify-between">
-              <CardTitle>Acceleration Data (m/s²)</CardTitle>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={resetAccelZoom}
-                disabled={!accelZoom.startIndex && !accelZoom.endIndex}
-              >
-                Reset Zoom
-              </Button>
-            </CardHeader>
-            <CardContent className="p-2">
-              <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis
-                      dataKey="time"
-                      tick={false}
-                      axisLine={false}
-                      domain={["dataMin", "dataMax"]}
-                      type="category"
-                    />
-                    <YAxis tick={{ fontSize: 10 }} width={60} />
-                    <ChartTooltip content={<ChartTooltipContent />} />
-                    <Line
-                      type="monotone"
-                      dataKey="accelX"
-                      stroke="var(--color-accelX)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Accel X"
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="accelY"
-                      stroke="var(--color-accelY)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Accel Y"
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="accelZ"
-                      stroke="var(--color-accelZ)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Accel Z"
-                      isAnimationActive={false}
-                    />
-                    <Brush
-                      dataKey="time"
-                      height={30}
-                      stroke="var(--color-accelX)"
-                      startIndex={accelZoom.startIndex}
-                      endIndex={accelZoom.endIndex}
-                      onChange={(brushData) => {
-                        if (brushData) {
-                          setAccelZoom({
-                            startIndex: brushData.startIndex,
-                            endIndex: brushData.endIndex,
-                          })
-                        }
-                      }}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </ChartContainer>
-            </CardContent>
-          </Card>
+            {/* Acceleration Chart */}
+            <Card className="bg-white border-gray-200">
+              <CardHeader className="flex flex-row items-center justify-between">
+                <CardTitle>Acceleration Data (m/s²)</CardTitle>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={resetAccelZoom}
+                  disabled={!accelZoom.startIndex && !accelZoom.endIndex}
+                >
+                  Reset Zoom
+                </Button>
+              </CardHeader>
+              <CardContent className="p-2">
+                <ChartContainer config={chartConfig} className="h-[400px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                      <XAxis
+                        dataKey="time"
+                        tick={false}
+                        axisLine={false}
+                        domain={["dataMin", "dataMax"]}
+                        type="category"
+                      />
+                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <ChartTooltip content={<ChartTooltipContent />} />
+                      <Line
+                        type="monotone"
+                        dataKey="accelX"
+                        stroke="var(--color-accelX)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Accel X"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="accelY"
+                        stroke="var(--color-accelY)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Accel Y"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="accelZ"
+                        stroke="var(--color-accelZ)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Accel Z"
+                        isAnimationActive={false}
+                      />
+                      <Brush
+                        dataKey="time"
+                        height={30}
+                        stroke="var(--color-accelX)"
+                        startIndex={accelZoom.startIndex}
+                        endIndex={accelZoom.endIndex}
+                        onChange={(brushData) => {
+                          if (brushData) {
+                            setAccelZoom({
+                              startIndex: brushData.startIndex,
+                              endIndex: brushData.endIndex,
+                            })
+                          }
+                        }}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartContainer>
+              </CardContent>
+            </Card>
 
-          {/* Gyroscope Chart */}
-          <Card className="bg-white border-gray-200">
-            <CardHeader className="flex flex-row items-center justify-between">
-              <CardTitle>Gyroscope Data (°/s)</CardTitle>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={resetGyroZoom}
-                disabled={!gyroZoom.startIndex && !gyroZoom.endIndex}
-              >
-                Reset Zoom
-              </Button>
-            </CardHeader>
-            <CardContent className="p-2">
-              <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis
-                      dataKey="time"
-                      tick={false}
-                      axisLine={false}
-                      domain={["dataMin", "dataMax"]}
-                      type="category"
-                    />
-                    <YAxis tick={{ fontSize: 10 }} width={60} />
-                    <ChartTooltip content={<ChartTooltipContent />} />
-                    <Line
-                      type="monotone"
-                      dataKey="gyroX"
-                      stroke="var(--color-gyroX)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Gyro X"
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="gyroY"
-                      stroke="var(--color-gyroY)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Gyro Y"
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="gyroZ"
-                      stroke="var(--color-gyroZ)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Gyro Z"
-                      isAnimationActive={false}
-                    />
-                    <Brush
-                      dataKey="time"
-                      height={30}
-                      stroke="var(--color-gyroX)"
-                      startIndex={gyroZoom.startIndex}
-                      endIndex={gyroZoom.endIndex}
-                      onChange={(brushData) => {
-                        if (brushData) {
-                          setGyroZoom({
-                            startIndex: brushData.startIndex,
-                            endIndex: brushData.endIndex,
-                          })
-                        }
-                      }}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </ChartContainer>
-            </CardContent>
-          </Card>
+            {/* Gyroscope Chart */}
+            <Card className="bg-white border-gray-200">
+              <CardHeader className="flex flex-row items-center justify-between">
+                <CardTitle>Gyroscope Data (°/s)</CardTitle>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={resetGyroZoom}
+                  disabled={!gyroZoom.startIndex && !gyroZoom.endIndex}
+                >
+                  Reset Zoom
+                </Button>
+              </CardHeader>
+              <CardContent className="p-2">
+                <ChartContainer config={chartConfig} className="h-[400px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                      <XAxis
+                        dataKey="time"
+                        tick={false}
+                        axisLine={false}
+                        domain={["dataMin", "dataMax"]}
+                        type="category"
+                      />
+                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <ChartTooltip content={<ChartTooltipContent />} />
+                      <Line
+                        type="monotone"
+                        dataKey="gyroX"
+                        stroke="var(--color-gyroX)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Gyro X"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="gyroY"
+                        stroke="var(--color-gyroY)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Gyro Y"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="gyroZ"
+                        stroke="var(--color-gyroZ)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Gyro Z"
+                        isAnimationActive={false}
+                      />
+                      <Brush
+                        dataKey="time"
+                        height={30}
+                        stroke="var(--color-gyroX)"
+                        startIndex={gyroZoom.startIndex}
+                        endIndex={gyroZoom.endIndex}
+                        onChange={(brushData) => {
+                          if (brushData) {
+                            setGyroZoom({
+                              startIndex: brushData.startIndex,
+                              endIndex: brushData.endIndex,
+                            })
+                          }
+                        }}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartContainer>
+              </CardContent>
+            </Card>
 
-          {/* Power Chart */}
-          <Card className="bg-white border-gray-200">
-            <CardHeader className="flex flex-row items-center justify-between">
-              <CardTitle>Power Data (W) — CycloWatt vs Reference</CardTitle>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={resetPowerZoom}
-                disabled={!powerZoom.startIndex && !powerZoom.endIndex}
-              >
-                Reset Zoom
-              </Button>
-            </CardHeader>
-            <CardContent className="p-2">
-              <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                    <XAxis
-                      dataKey="time"
-                      tick={false}
-                      axisLine={false}
-                      domain={["dataMin", "dataMax"]}
-                      type="category"
-                    />
-                    <YAxis tick={{ fontSize: 10 }} width={60} />
-                    <ChartTooltip content={<ChartTooltipContent />} />
-                    <Line
-                      type="monotone"
-                      dataKey="power"
-                      stroke="var(--color-power)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="CycloWatt Power"
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="referencePower"
-                      stroke="var(--color-referencePower)"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Reference Power"
-                      isAnimationActive={false}
-                    />
-                    <Brush
-                      dataKey="time"
-                      height={30}
-                      stroke="var(--color-power)"
-                      startIndex={powerZoom.startIndex}
-                      endIndex={powerZoom.endIndex}
-                      onChange={(brushData) => {
-                        if (brushData) {
-                          setPowerZoom({
-                            startIndex: brushData.startIndex,
-                            endIndex: brushData.endIndex,
-                          })
-                        }
-                      }}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </ChartContainer>
-            </CardContent>
-          </Card>
-        </div>
+            {/* Power Chart */}
+            <Card className="bg-white border-gray-200">
+              <CardHeader className="flex flex-row items-center justify-between">
+                <CardTitle>Power Data (W) — CycloWatt vs Reference</CardTitle>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={resetPowerZoom}
+                  disabled={!powerZoom.startIndex && !powerZoom.endIndex}
+                >
+                  Reset Zoom
+                </Button>
+              </CardHeader>
+              <CardContent className="p-2">
+                <ChartContainer config={chartConfig} className="h-[400px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                      <XAxis
+                        dataKey="time"
+                        tick={false}
+                        axisLine={false}
+                        domain={["dataMin", "dataMax"]}
+                        type="category"
+                      />
+                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <ChartTooltip content={<ChartTooltipContent />} />
+                      <Line
+                        type="monotone"
+                        dataKey="power"
+                        stroke="var(--color-power)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="CycloWatt Power"
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="referencePower"
+                        stroke="var(--color-referencePower)"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Reference Power"
+                        isAnimationActive={false}
+                      />
+                      <Brush
+                        dataKey="time"
+                        height={30}
+                        stroke="var(--color-power)"
+                        startIndex={powerZoom.startIndex}
+                        endIndex={powerZoom.endIndex}
+                        onChange={(brushData) => {
+                          if (brushData) {
+                            setPowerZoom({
+                              startIndex: brushData.startIndex,
+                              endIndex: brushData.endIndex,
+                            })
+                          }
+                        }}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartContainer>
+              </CardContent>
+            </Card>
+          </div>
+        )}
 
         {/* Chart Controls */}
-        <Card className="bg-white border-gray-200">
-          <CardHeader>
-            <CardTitle>Chart Controls</CardTitle>
-          </CardHeader>
-          <CardContent className="flex gap-2">
-            <Button
-              variant="outline"
-              onClick={resetAllZoom}
-              disabled={
-                !compressionZoom.startIndex &&
-                !shearZoom.startIndex &&
-                !accelZoom.startIndex &&
-                !gyroZoom.startIndex &&
-                !powerZoom.startIndex
-              }
-            >
-              Reset All Zoom
-            </Button>
-          </CardContent>
-        </Card>
+        {connectionMode === "normal" && (
+          <Card className="bg-white border-gray-200">
+            <CardHeader>
+              <CardTitle>Chart Controls</CardTitle>
+            </CardHeader>
+            <CardContent className="flex gap-2">
+              <Button
+                variant="outline"
+                onClick={resetAllZoom}
+                disabled={
+                  !compressionZoom.startIndex &&
+                  !shearZoom.startIndex &&
+                  !accelZoom.startIndex &&
+                  !gyroZoom.startIndex &&
+                  !powerZoom.startIndex
+                }
+              >
+                Reset All Zoom
+              </Button>
+            </CardContent>
+          </Card>
+        )}
       </div>
     </div>
   )
