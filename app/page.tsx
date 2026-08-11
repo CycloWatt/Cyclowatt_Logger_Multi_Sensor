@@ -105,6 +105,28 @@ export default function BluetoothDataLogger() {
   const [gyroZoom, setGyroZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
   const [powerZoom, setPowerZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
 
+  // Per-line visibility for each chart
+  const [lineVisibility, setLineVisibility] = useState<Record<string, boolean>>({
+    force0: true,
+    force2: true,
+    force4: true,
+    force1: true,
+    force3: true,
+    force5: true,
+    accelX: true,
+    accelY: true,
+    accelZ: true,
+    gyroX: true,
+    gyroY: true,
+    gyroZ: true,
+    power: true,
+    referencePower: true,
+  })
+
+  const toggleLine = (key: string) => {
+    setLineVisibility((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
+
   // Refs for efficient data handling
   const dataBufferRef = useRef<DataPoint[]>([])
   const lastUpdateRef = useRef<number>(Date.now())
@@ -232,6 +254,75 @@ export default function BluetoothDataLogger() {
       label: "Sync",
       color: "hsl(var(--chart-1))",
     },
+  }
+
+  // Renders clickable legend chips that toggle each line's visibility
+  const renderLineToggles = (keys: string[]) => (
+    <div className="flex flex-wrap gap-2 px-2 pb-2">
+      {keys.map((key) => {
+        const config = chartConfig[key as keyof typeof chartConfig]
+        const visible = lineVisibility[key]
+        return (
+          <button
+            key={key}
+            type="button"
+            onClick={() => toggleLine(key)}
+            aria-pressed={visible}
+            className={`flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-medium transition-colors ${
+              visible
+                ? "border-gray-300 bg-gray-50 text-gray-900"
+                : "border-gray-200 bg-transparent text-gray-400"
+            }`}
+          >
+            <span
+              className="h-2.5 w-2.5 rounded-full"
+              style={{ backgroundColor: visible ? config.color : "transparent", border: `1px solid ${config.color}` }}
+            />
+            {config.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+
+  // Y-axis range derived from only what is actually on screen: the currently visible
+  // channels, restricted to the brushed index window. Hiding a channel with a large
+  // range therefore rescales the axis around the ones that remain.
+  const getYDomain = (
+    keys: string[],
+    zoom: { startIndex?: number; endIndex?: number },
+  ): [number | "auto", number | "auto"] => {
+    const visibleKeys = keys.filter((key) => lineVisibility[key])
+    if (visibleKeys.length === 0 || chartData.length === 0) return ["auto", "auto"]
+
+    const start = Math.max(0, zoom.startIndex ?? 0)
+    const end = Math.min(chartData.length - 1, zoom.endIndex ?? chartData.length - 1)
+
+    let min = Number.POSITIVE_INFINITY
+    let max = Number.NEGATIVE_INFINITY
+
+    for (let i = start; i <= end; i++) {
+      const point = chartData[i]
+      if (!point) continue
+      for (const key of visibleKeys) {
+        const value = point[key as keyof ChartDataPoint]
+        if (typeof value !== "number" || !Number.isFinite(value)) continue
+        if (value < min) min = value
+        if (value > max) max = value
+      }
+    }
+
+    // No usable samples in this window yet — let recharts pick.
+    if (min === Number.POSITIVE_INFINITY) return ["auto", "auto"]
+
+    // Flat signal: give it headroom so the line isn't pinned to an axis edge.
+    if (min === max) {
+      const pad = Math.abs(min) * 0.1 || 1
+      return [min - pad, max + pad]
+    }
+
+    const pad = (max - min) * 0.05
+    return [min - pad, max + pad]
   }
 
   const updateCharts = () => {
@@ -1202,6 +1293,7 @@ export default function BluetoothDataLogger() {
                 </Button>
               </CardHeader>
               <CardContent className="p-2">
+                {renderLineToggles(["force0", "force2", "force4"])}
                 <ChartContainer config={chartConfig} className="h-[400px] w-full">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
@@ -1213,7 +1305,12 @@ export default function BluetoothDataLogger() {
                         domain={["dataMin", "dataMax"]}
                         type="category"
                       />
-                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <YAxis
+                        tick={{ fontSize: 10 }}
+                        width={60}
+                        domain={getYDomain(["force0", "force2", "force4"], compressionZoom)}
+                        allowDataOverflow
+                      />
                       <ChartTooltip content={<ChartTooltipContent />} />
                       <Line
                         type="monotone"
@@ -1223,6 +1320,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Channel 0"
                         isAnimationActive={false}
+                        hide={!lineVisibility.force0}
                       />
                       <Line
                         type="monotone"
@@ -1232,6 +1330,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Channel 2"
                         isAnimationActive={false}
+                        hide={!lineVisibility.force2}
                       />
                       <Line
                         type="monotone"
@@ -1241,6 +1340,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Channel 4"
                         isAnimationActive={false}
+                        hide={!lineVisibility.force4}
                       />
                       <Brush
                         dataKey="time"
@@ -1277,6 +1377,7 @@ export default function BluetoothDataLogger() {
                 </Button>
               </CardHeader>
               <CardContent className="p-2">
+                {renderLineToggles(["force1", "force3", "force5"])}
                 <ChartContainer config={chartConfig} className="h-[400px] w-full">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
@@ -1288,7 +1389,12 @@ export default function BluetoothDataLogger() {
                         domain={["dataMin", "dataMax"]}
                         type="category"
                       />
-                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <YAxis
+                        tick={{ fontSize: 10 }}
+                        width={60}
+                        domain={getYDomain(["force1", "force3", "force5"], shearZoom)}
+                        allowDataOverflow
+                      />
                       <ChartTooltip content={<ChartTooltipContent />} />
                       <Line
                         type="monotone"
@@ -1298,6 +1404,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Channel 1"
                         isAnimationActive={false}
+                        hide={!lineVisibility.force1}
                       />
                       <Line
                         type="monotone"
@@ -1307,6 +1414,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Channel 3"
                         isAnimationActive={false}
+                        hide={!lineVisibility.force3}
                       />
                       <Line
                         type="monotone"
@@ -1316,6 +1424,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Channel 5"
                         isAnimationActive={false}
+                        hide={!lineVisibility.force5}
                       />
                       <Brush
                         dataKey="time"
@@ -1352,6 +1461,7 @@ export default function BluetoothDataLogger() {
                 </Button>
               </CardHeader>
               <CardContent className="p-2">
+                {renderLineToggles(["accelX", "accelY", "accelZ"])}
                 <ChartContainer config={chartConfig} className="h-[400px] w-full">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
@@ -1363,7 +1473,12 @@ export default function BluetoothDataLogger() {
                         domain={["dataMin", "dataMax"]}
                         type="category"
                       />
-                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <YAxis
+                        tick={{ fontSize: 10 }}
+                        width={60}
+                        domain={getYDomain(["accelX", "accelY", "accelZ"], accelZoom)}
+                        allowDataOverflow
+                      />
                       <ChartTooltip content={<ChartTooltipContent />} />
                       <Line
                         type="monotone"
@@ -1373,6 +1488,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Accel X"
                         isAnimationActive={false}
+                        hide={!lineVisibility.accelX}
                       />
                       <Line
                         type="monotone"
@@ -1382,6 +1498,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Accel Y"
                         isAnimationActive={false}
+                        hide={!lineVisibility.accelY}
                       />
                       <Line
                         type="monotone"
@@ -1391,6 +1508,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Accel Z"
                         isAnimationActive={false}
+                        hide={!lineVisibility.accelZ}
                       />
                       <Brush
                         dataKey="time"
@@ -1427,6 +1545,7 @@ export default function BluetoothDataLogger() {
                 </Button>
               </CardHeader>
               <CardContent className="p-2">
+                {renderLineToggles(["gyroX", "gyroY", "gyroZ"])}
                 <ChartContainer config={chartConfig} className="h-[400px] w-full">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
@@ -1438,7 +1557,12 @@ export default function BluetoothDataLogger() {
                         domain={["dataMin", "dataMax"]}
                         type="category"
                       />
-                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <YAxis
+                        tick={{ fontSize: 10 }}
+                        width={60}
+                        domain={getYDomain(["gyroX", "gyroY", "gyroZ"], gyroZoom)}
+                        allowDataOverflow
+                      />
                       <ChartTooltip content={<ChartTooltipContent />} />
                       <Line
                         type="monotone"
@@ -1448,6 +1572,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Gyro X"
                         isAnimationActive={false}
+                        hide={!lineVisibility.gyroX}
                       />
                       <Line
                         type="monotone"
@@ -1457,6 +1582,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Gyro Y"
                         isAnimationActive={false}
+                        hide={!lineVisibility.gyroY}
                       />
                       <Line
                         type="monotone"
@@ -1466,6 +1592,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Gyro Z"
                         isAnimationActive={false}
+                        hide={!lineVisibility.gyroZ}
                       />
                       <Brush
                         dataKey="time"
@@ -1502,6 +1629,7 @@ export default function BluetoothDataLogger() {
                 </Button>
               </CardHeader>
               <CardContent className="p-2">
+                {renderLineToggles(["power", "referencePower"])}
                 <ChartContainer config={chartConfig} className="h-[400px] w-full">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
@@ -1513,7 +1641,12 @@ export default function BluetoothDataLogger() {
                         domain={["dataMin", "dataMax"]}
                         type="category"
                       />
-                      <YAxis tick={{ fontSize: 10 }} width={60} />
+                      <YAxis
+                        tick={{ fontSize: 10 }}
+                        width={60}
+                        domain={getYDomain(["power", "referencePower"], powerZoom)}
+                        allowDataOverflow
+                      />
                       <ChartTooltip content={<ChartTooltipContent />} />
                       <Line
                         type="monotone"
@@ -1523,6 +1656,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="CycloWatt Power"
                         isAnimationActive={false}
+                        hide={!lineVisibility.power}
                       />
                       <Line
                         type="monotone"
@@ -1532,6 +1666,7 @@ export default function BluetoothDataLogger() {
                         dot={false}
                         name="Reference Power"
                         isAnimationActive={false}
+                        hide={!lineVisibility.referencePower}
                       />
                       <Brush
                         dataKey="time"
