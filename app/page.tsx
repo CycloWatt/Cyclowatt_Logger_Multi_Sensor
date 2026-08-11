@@ -12,6 +12,7 @@ import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
 import type { RequestDeviceOptions } from "web-bluetooth"
 import { SMP_SERVICE_UUID } from "@/lib/smp/client"
+import { firmwareVersionFromName } from "@/lib/device-name"
 import { DfuCard } from "@/components/dfu-card"
 
 interface DataPoint {
@@ -59,6 +60,10 @@ interface AvailableDevice {
   name: string
   id: string
   hasTargetService: boolean
+  // true = came from Chrome's list of already-granted devices (getDevices()) rather
+  // than from a fresh chooser pick, so the row can say so: it is a permission
+  // record, NOT evidence the board is powered on or in range right now.
+  remembered: boolean
 }
 
 export default function BluetoothDataLogger() {
@@ -77,6 +82,15 @@ export default function BluetoothDataLogger() {
   // DFU-only mode exists because prod images don't advertise the raw-stream service
   // (decision D1) — without it, a board flashed to prod could never be reached again.
   const [connectionMode, setConnectionMode] = useState<"normal" | "dfu">("normal")
+  // Sensor battery percentage from the firmware's standard Battery Service (BAS).
+  // null = unknown/unavailable, so the connected panel simply omits the line.
+  const [batteryLevel, setBatteryLevel] = useState<number | null>(null)
+  // Firmware version parsed from the device name, LATCHED at connect time so a CSV
+  // exported after the link is gone still carries the build it was captured on. It
+  // deliberately outlives the session (handleDisconnection nulls `device` while
+  // allData survives and Export stays enabled), and is overwritten by the next
+  // successful connect. null = the name carried no parsable version.
+  const [connectedFwVersion, setConnectedFwVersion] = useState<string | null>(null)
 
   const [serialPort, setSerialPort] = useState<SerialPort | null>(null)
   const [isSerialConnected, setIsSerialConnected] = useState(false)
@@ -169,6 +183,41 @@ export default function BluetoothDataLogger() {
       console.error("Not in secure context")
       setError("Bluetooth and Serial require HTTPS. Please access this page via HTTPS or localhost.")
     }
+  }, [])
+
+  // List devices the user already granted access to, so repeat flash/test cycles skip
+  // the chooser after every page reload. Chrome keeps these grants per-origin and
+  // exposes them via navigator.bluetooth.getDevices(); it is NOT in the Web Bluetooth
+  // spec's baseline, so it is feature-detected rather than assumed.
+  //
+  // Caveats intentionally accepted: the list is every past grant on this origin — it can
+  // include non-CycloWatt devices and devices whose `gatt` is undefined, and it says
+  // nothing about whether a board is powered on or in range. Entries therefore get
+  // hasTargetService: false (same as an unprobed scan hit) and only turn "Compatible"
+  // once a real scan probes their services.
+  useEffect(() => {
+    const bt = navigator.bluetooth as (Bluetooth & { getDevices?: () => Promise<BluetoothDevice[]> }) | undefined
+    if (!bt?.getDevices) return
+    void bt
+      .getDevices()
+      .then((granted) => {
+        setAvailableDevices((prev) => {
+          // Never overwrite an entry a scan already probed — its hasTargetService is
+          // real information, and this effect has none to offer.
+          const known = new Set(prev.map((d) => d.id))
+          const remembered = granted
+            .filter((d) => !known.has(d.id))
+            .map((device) => ({
+              device,
+              name: device.name || "Unknown Device",
+              id: device.id,
+              hasTargetService: false,
+              remembered: true,
+            }))
+          return [...prev, ...remembered]
+        })
+      })
+      .catch(() => {}) // permission-API hiccups are non-fatal — the user can still Scan
   }, [])
 
   const chartConfig = {
@@ -467,11 +516,17 @@ export default function BluetoothDataLogger() {
       const requestOptions: RequestDeviceOptions = useUuidFilter
         ? {
             filters: [{ services: [CYCLOWATT_SERVICE_UUID] }],
-            optionalServices: [SMP_SERVICE_UUID, "generic_access", "generic_attribute"],
+            optionalServices: [SMP_SERVICE_UUID, "battery_service", "generic_access", "generic_attribute"],
           }
         : {
             acceptAllDevices: true,
-            optionalServices: [CYCLOWATT_SERVICE_UUID, SMP_SERVICE_UUID, "generic_access", "generic_attribute"],
+            optionalServices: [
+              CYCLOWATT_SERVICE_UUID,
+              SMP_SERVICE_UUID,
+              "battery_service",
+              "generic_access",
+              "generic_attribute",
+            ],
           }
 
       const device = await navigator.bluetooth.requestDevice(requestOptions)
@@ -532,6 +587,10 @@ export default function BluetoothDataLogger() {
         name: device.name || "Unknown Device",
         id: device.id,
         hasTargetService,
+        // Picked through the chooser in this session — the row shows live scan
+        // results, so no "(remembered)" hint. This also intentionally clears the
+        // flag when a re-scan replaces a remembered entry (see the merge below).
+        remembered: false,
       }
 
       setAvailableDevices((prev) => {
@@ -553,6 +612,25 @@ export default function BluetoothDataLogger() {
 
   // Connect to a specific device
   const connectToSpecificDevice = async (selectedDevice: AvailableDevice) => {
+    // Distinguishes "the link never came up" from "the link came up but the board isn't
+    // what we expected" — the two need different error copy (see the catch).
+    let gattConnected = false
+    // Flips once the page has taken ownership of the link (the state-setter block below).
+    // Only a failure BEFORE that point may tear the link down: after it,
+    // the page owns a live session and an unsolicited disconnect here would kill it behind
+    // the UI's back. Today's post-ownership steps (battery probe, stream start) swallow
+    // their own errors, so this guard is currently belt-and-braces — kept explicit so a
+    // future throw added after ownership can't silently start tearing sessions down.
+    let sessionOwned = false
+    // Was the link ALREADY up before this call? gatt.connect() on an
+    // already-connected server resolves instantly as a no-op, so gattConnected
+    // alone cannot tell "this call opened the link" from "someone else's link
+    // was already open". Without this, misclicking the remembered row of the
+    // live reference CPS meter — whose session is tracked by isRefConnected,
+    // not isConnected, so the Connect button stays enabled — would make the
+    // catch below tear down the reference capture mid-recording. Only release
+    // a link this call actually opened.
+    const alreadyLinked = !!selectedDevice.device.gatt?.connected
     try {
       setError("")
       console.log(`\n🔗 CONNECTING TO: ${selectedDevice.name}`)
@@ -561,6 +639,7 @@ export default function BluetoothDataLogger() {
 
       const device = selectedDevice.device
       const server = await device.gatt!.connect()
+      gattConnected = true
       console.log("✅ Connected to GATT server")
 
       // Get the CycloWatt service
@@ -590,17 +669,74 @@ export default function BluetoothDataLogger() {
       setCharacteristic(dataCharacteristic)
       setIsConnected(true)
       setConnectionMode("normal")
+      // Latch the build for the CSV filename now, while the name is in hand.
+      setConnectedFwVersion(firmwareVersionFromName(device.name))
+      sessionOwned = true
 
       device.addEventListener("gattserverdisconnected", handleDisconnection)
 
       console.log("🎉 CONNECTION SUCCESSFUL!")
       console.log("🚀 Ready to start data streaming...")
 
+      // Battery is best-effort: an absent service (old grant / non-CycloWatt device) must
+      // not fail the connect. Web Bluetooth subtlety — if the device was granted BEFORE
+      // "battery_service" was listed in optionalServices, getPrimaryService throws
+      // SecurityError, which the catch treats as "no battery shown"; re-picking the device
+      // through the chooser once repairs the grant. The listener is attached BEFORE
+      // startNotifications so the first notification can't be missed.
+      try {
+        const batteryService = await server.getPrimaryService("battery_service")
+        const batteryChar = await batteryService.getCharacteristic("battery_level")
+        const initial = await batteryChar.readValue()
+        setBatteryLevel(initial.getUint8(0))
+        batteryChar.addEventListener("characteristicvaluechanged", (event) => {
+          const value = (event.target as BluetoothRemoteGATTCharacteristic).value
+          if (value) setBatteryLevel(value.getUint8(0))
+        })
+        await batteryChar.startNotifications()
+        console.log("🔋 Battery Service subscribed")
+      } catch (batteryErr) {
+        // No reset here: batteryLevel is already null on entry to any connect path (initial
+        // state, and handleDisconnection clears it on every disconnect route), so the panel
+        // omits the line by itself. Nulling would instead discard a good reading in the case
+        // where readValue succeeded and only startNotifications failed — that value is kept,
+        // it just won't refresh.
+        console.warn("No battery level available (service not granted/present):", batteryErr)
+      }
+
       // Auto-start streaming
       await startDataStreaming(dataCharacteristic)
     } catch (err) {
       console.error("Connection failed:", err)
-      setError(`Connection failed: ${err instanceof Error ? err.message : "Unknown error"}`)
+      const message = err instanceof Error ? err.message : "Unknown error"
+
+      // Release the link on a failed connect. The board has ONE peripheral slot: leaving a
+      // dangling GATT connection makes it stop advertising and locks out the coupled shoe /
+      // head unit — i.e. it manufactures the very "single BLE slot is taken" state the copy
+      // below warns about. Only safe while the page hasn't taken ownership (see sessionOwned),
+      // and only for a link THIS call opened (see alreadyLinked); if gatt never connected
+      // there is nothing to release.
+      if (gattConnected && !alreadyLinked && !sessionOwned) {
+        selectedDevice.device.gatt?.disconnect()
+        console.log("🔌 Released the GATT link after a failed connect")
+      }
+
+      if (gattConnected) {
+        // The link came up, so the board is awake and reachable — the failure is about
+        // what it exposes (e.g. a prod image with no raw-stream service, or a granted
+        // non-CycloWatt device). Don't blame sleep or a busy radio here.
+        setError(`Connection failed: ${message}`)
+      } else {
+        // On this hardware an unreachable-but-recently-advertising board is almost always
+        // one of two things, and Chrome's raw error ("Bluetooth Device is no longer in
+        // range" / "connection attempt failed") says neither. Name both so the bench user
+        // acts instead of retrying blindly.
+        setError(
+          `Could not connect to ${selectedDevice.name}. If it advertised recently it is likely either ` +
+            `asleep (inactivity power-off — move or tap the shoe to wake it) or its single BLE slot is ` +
+            `taken (coupled to the other shoe, or a head unit is connected). Original error: ${message}`,
+        )
+      }
     }
   }
 
@@ -611,6 +747,7 @@ export default function BluetoothDataLogger() {
     setDevice(null)
     setService(null)
     setCharacteristic(null)
+    setBatteryLevel(null)
     // Any disconnect ends the session's mode. Without this, a DFU-only session
     // would leave the logging UI hidden until a successful raw-stream connect —
     // which a freshly-flashed prod image (no raw-stream service) can never provide.
@@ -642,7 +779,13 @@ export default function BluetoothDataLogger() {
       console.log("\n🔧 CONNECTING IN DFU-ONLY MODE...")
       const dfuDevice = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: "Cyclowatt" }, { namePrefix: "CycloRaw" }],
-        optionalServices: [SMP_SERVICE_UUID, CYCLOWATT_SERVICE_UUID, "generic_access", "generic_attribute"],
+        optionalServices: [
+          SMP_SERVICE_UUID,
+          CYCLOWATT_SERVICE_UUID,
+          "battery_service",
+          "generic_access",
+          "generic_attribute",
+        ],
       })
       await dfuDevice.gatt!.connect()
       console.log(`✅ DFU-only connection to: ${dfuDevice.name || "Unknown"} (${dfuDevice.id})`)
@@ -870,7 +1013,17 @@ export default function BluetoothDataLogger() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement("a")
     a.href = url
-    a.download = `cyclowatt_data_${new Date().toISOString().split("T")[0]}.csv`
+    // Stamp the connected board's firmware version into the FILENAME only (CSV
+    // content stays byte-identical) so a bench capture is attributable to a build.
+    const timestampPart = new Date().toISOString().split("T")[0]
+    // Read the LATCH, not `device?.name`: the usual bench order is record →
+    // disconnect → export, and by export time handleDisconnection has already
+    // nulled `device` while allData survives and Export stays enabled — parsing
+    // the live name here dropped the _fw tag exactly when it mattered most. The
+    // live name is only a fallback for a session that predates the latch.
+    const fwVersion = connectedFwVersion ?? firmwareVersionFromName(device?.name)
+    const versionTag = fwVersion ? `_fw${fwVersion}` : ""
+    a.download = `cyclowatt_data_${timestampPart}${versionTag}.csv`
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
@@ -1117,7 +1270,14 @@ export default function BluetoothDataLogger() {
                     <div key={availableDevice.id} className="flex items-center justify-between p-3 border rounded-lg">
                       <div className="flex items-center gap-3">
                         <div className="flex flex-col">
-                          <span className="font-medium">{availableDevice.name}</span>
+                          <span className="font-medium">
+                            {availableDevice.name}{" "}
+                            {/* Flags a permission record from a past session, not a live
+                                scan hit — the board may well be asleep or busy. */}
+                            {availableDevice.remembered && (
+                              <span className="text-xs text-muted-foreground">(remembered)</span>
+                            )}
+                          </span>
                           <span className="text-xs text-gray-500">{availableDevice.id}</span>
                         </div>
                         {availableDevice.hasTargetService && (
@@ -1143,6 +1303,7 @@ export default function BluetoothDataLogger() {
             {isConnected && (
               <div className="text-sm text-gray-600 p-3 bg-green-50 border border-green-200 rounded-lg">
                 <div className="font-medium">Connected to: {device?.name || "Unknown Device"}</div>
+                {batteryLevel !== null && <div>Battery: {batteryLevel}%</div>}
                 <div>Service: {CYCLOWATT_SERVICE_UUID}</div>
                 <div>Characteristic: {CYCLOWATT_DATA_CHAR_UUID}</div>
                 <div>Data Format: 16x int32 (6x Force, Accel X/Y/Z, Gyro X/Y/Z, Power, Tick, TicksMCU)</div>

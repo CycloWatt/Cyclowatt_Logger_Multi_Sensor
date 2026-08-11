@@ -1,19 +1,22 @@
 "use client"
 
-import { useRef, useState, type ChangeEvent } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
 import { UploadCloud } from "lucide-react"
+import { DevicePanel } from "@/components/device-panel"
+import { ImagePicker } from "@/components/image-picker"
 import {
-  SMP_CHARACTERISTIC_UUID,
-  SMP_SERVICE_UUID,
-  SmpClient,
-  type ImageSlotState,
-} from "@/lib/smp/client"
-import { parseMcubootImage, type McubootImageInfo } from "@/lib/smp/mcuboot"
+  appendFlashRecord,
+  readFlashHistory,
+  throughputKbps,
+  type FlashRecord,
+} from "@/lib/flash-history"
+import { type ImageSlotState, type SmpClient } from "@/lib/smp/client"
+import { openSmpClient } from "@/lib/smp/gatt"
+import { type McubootImageInfo } from "@/lib/smp/mcuboot"
 import { ImageUploader, type UploadProgress } from "@/lib/smp/upload"
 
 interface DfuCardProps {
@@ -51,9 +54,14 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
   const [progress, setProgress] = useState<UploadProgress | null>(null)
   const [bootedVersion, setBootedVersion] = useState("")
   const [errorText, setErrorText] = useState("")
+  const [history, setHistory] = useState<FlashRecord[]>([])
 
   const fileBytesRef = useRef<Uint8Array | null>(null)
   const uploaderRef = useRef<ImageUploader | null>(null)
+  // Wall clock of the flash attempt currently in flight, or null when no attempt is
+  // open. Doubles as the "an attempt is armed" flag: only an armed attempt may be
+  // recorded, and recording disarms it, so nothing double-records.
+  const flashStartRef = useRef<number | null>(null)
   // The device is captured when the flow starts: the page clears its own device
   // state on disconnect, but resume and the post-reset reconnect need this exact
   // BluetoothDevice object (a retained device reconnects without a new chooser).
@@ -62,36 +70,55 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
   const busy =
     phase === "starting" || phase === "uploading" || phase === "activating" || phase === "reconnecting"
 
-  const handleFilePicked = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    if (!file) return
+  // localStorage is browser-only, so the first render (which also runs during the
+  // Next prerender) must not touch it — load the log after mount instead.
+  useEffect(() => setHistory(readFlashHistory()), [])
+
+  /**
+   * Close the flash attempt currently in flight and log it. Passive: it only
+   * reads state the flow already keeps, never steers the flow.
+   *
+   * Guarded on flashStartRef, because failWith also fires on paths where no
+   * upload ever started (no image picked, openSmpClient throws before the flow
+   * arms) and because a flow must produce exactly ONE record: recording disarms
+   * the ref, so a later failWith on the same attempt is a no-op.
+   */
+  const recordFlash = (outcome: FlashRecord["outcome"]) => {
+    const startedAt = flashStartRef.current
+    if (startedAt === null) return
+    flashStartRef.current = null
+    appendFlashRecord({
+      deviceId: deviceRef.current?.id ?? "unknown",
+      deviceName: deviceRef.current?.name ?? "unknown",
+      version: fileInfo?.version ?? "?",
+      startedAt,
+      durationMs: Date.now() - startedAt,
+      sizeBytes: fileBytesRef.current?.length ?? 0,
+      outcome,
+    })
+    setHistory(readFlashHistory())
+  }
+
+  /**
+   * A new image was chosen (ImagePicker already validated it through
+   * parseMcubootImage, and owns the per-source error reporting). Clear the
+   * previous run's result so the card never shows a stale success panel or
+   * progress bar next to a freshly picked image.
+   */
+  const handleImagePicked = (bytes: Uint8Array, info: McubootImageInfo, label: string) => {
+    fileBytesRef.current = bytes
+    // Drop any abandoned uploader with it: a resumable one still reports
+    // canResume, so a later startFlow that fails BEFORE arming (board asleep →
+    // openSmpClient throws) would offer Resume, and resumeFlow would push the
+    // OLD bytes — which pass verification whenever both builds share the
+    // version triple, i.e. the normal bench case.
+    uploaderRef.current = null
+    setFileInfo(info)
+    setFileName(label)
     setErrorText("")
     setBootedVersion("")
     setPhase("idle")
     setProgress(null)
-    try {
-      const bytes = new Uint8Array(await file.arrayBuffer())
-      const info = parseMcubootImage(bytes) // rejects unsigned/truncated files up front
-      fileBytesRef.current = bytes
-      setFileInfo(info)
-      setFileName(file.name)
-    } catch (err) {
-      fileBytesRef.current = null
-      setFileInfo(null)
-      setFileName(file.name)
-      setErrorText(err instanceof Error ? err.message : "Could not read the file")
-    }
-  }
-
-  /** Connect (or re-connect) the GATT link and attach an SMP client to it. */
-  const openSmpClient = async (target: BluetoothDevice): Promise<SmpClient> => {
-    if (!target.gatt) throw new Error("Device has no GATT interface")
-    const server = target.gatt.connected ? target.gatt : await target.gatt.connect()
-    const service = await server.getPrimaryService(SMP_SERVICE_UUID)
-    const characteristic = await service.getCharacteristic(SMP_CHARACTERISTIC_UUID)
-    const client = new SmpClient(characteristic)
-    await client.initialize()
-    return client
   }
 
   /** Retry gatt.connect() until the rebooting device advertises again. */
@@ -115,7 +142,12 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
 
   const failWith = (err: unknown) => {
     setErrorText(err instanceof Error ? err.message : "Unknown error")
-    setPhase(uploaderRef.current?.canResume ? "disconnected" : "error")
+    const resumable = uploaderRef.current?.canResume ?? false
+    setPhase(resumable ? "disconnected" : "error")
+    // A resumable drop is not an outcome yet — leave the attempt armed so a
+    // successful resume logs ONE record whose duration spans the whole
+    // interrupted affair (that is the number the bench cares about).
+    if (!resumable) recordFlash("failed")
   }
 
   /** Upload finished → mark pending, reboot, wait for the new image, verify it booted. */
@@ -164,6 +196,7 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
         }
         setBootedVersion(booted.version)
         setPhase("success")
+        recordFlash("success")
       } finally {
         verifyClient.dispose()
       }
@@ -181,6 +214,10 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
     const info = fileInfo
     if (!bytes || !info || !device) return
     deviceRef.current = device
+    // Starting a fresh flow abandons any still-armed earlier attempt (e.g. a
+    // resumable drop the operator chose not to resume) — its stale timestamp must
+    // not be inherited by this run.
+    flashStartRef.current = null
     setErrorText("")
     setPhase("starting")
     try {
@@ -190,6 +227,12 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
       const uploader = new ImageUploader()
       uploaderRef.current = uploader
       uploader.onProgress = setProgress
+      // Arm the attempt only now, with the SMP link already open: a failure in
+      // stopStreaming or openSmpClient means no bytes ever moved, and logging that
+      // as a flash would inject a 1-5 s record carrying the full image size — an
+      // ~800 kbit/s phantom in exactly the throughput data this log exists to
+      // collect. Everything from the first chunk onwards does get recorded.
+      flashStartRef.current = Date.now()
       setPhase("uploading")
       try {
         await uploader.start(bytes, client)
@@ -200,6 +243,9 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
       if (uploader.phase === "aborted") {
         client.dispose()
         setPhase("idle")
+        // A user abort is a cancellation, not an outcome (FlashRecord only knows
+        // success/failed) — disarm so it is neither logged now nor later.
+        flashStartRef.current = null
         return
       }
       await activateAndVerify(client, info)
@@ -228,6 +274,9 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
       if (uploader.phase === "aborted") {
         client.dispose()
         setPhase("idle")
+        // A user abort is a cancellation, not an outcome (FlashRecord only knows
+        // success/failed) — disarm so it is neither logged now nor later.
+        flashStartRef.current = null
         return
       }
       await activateAndVerify(client, info)
@@ -252,7 +301,7 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="space-y-2">
-          <Input type="file" accept=".bin" onChange={handleFilePicked} disabled={busy} />
+          <ImagePicker disabled={busy} onImage={handleImagePicked} />
           {fileInfo && (
             <div className="text-sm text-gray-600 p-3 bg-gray-50 border border-gray-200 rounded-lg">
               <div className="font-medium">{fileName}</div>
@@ -294,6 +343,38 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
         {phase === "success" && (
           <div className="text-sm text-gray-600 p-3 bg-green-50 border border-green-200 rounded-lg">
             <div className="font-medium">Device is now running {bootedVersion}</div>
+          </div>
+        )}
+
+        {/*
+          Bench controls: read-only image state plus a remote reboot. Disabled
+          while a flash flow runs so its short-lived SMP client can never take
+          the characteristic out from under the uploader.
+        */}
+        <DevicePanel device={device} busy={busy} />
+
+        {/*
+          Bench log of past flashes (this browser only). The wall clock and the
+          derived kbit/s are the raw material for the pipelined-upload decision.
+          Both are END-TO-END (upload + activate + reboot + verify), never the
+          upload alone — hence the explicit "total"/"avg" labels, so a low kbit/s
+          is not misread as the link being slow.
+        */}
+        {history.length > 0 && (
+          <div className="space-y-1">
+            <div className="text-sm font-medium">Flash history (end-to-end)</div>
+            {history.slice(0, 5).map((r) => (
+              // startedAt alone can collide only in the conceivable same-millisecond
+              // pair, so the outcome and the board join the key.
+              <div
+                key={`${r.startedAt}-${r.outcome}-${r.deviceId}`}
+                className="text-sm text-gray-500"
+              >
+                {new Date(r.startedAt).toLocaleString()} — v{r.version} → {r.deviceName} ·{" "}
+                {(r.durationMs / 1000).toFixed(1)} s total · {throughputKbps(r).toFixed(0)} kbit/s
+                avg · {r.outcome}
+              </div>
+            ))}
           </div>
         )}
 
