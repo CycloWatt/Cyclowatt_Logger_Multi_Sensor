@@ -1,10 +1,14 @@
 /**
  * Mini-CBOR codec (RFC 8949 subset) for MCUmgr SMP payloads — decision D2.
  *
- * Deliberately covers ONLY what SMP needs: definite-length maps and arrays,
- * unsigned/negative integers up to 2^53-1, UTF-8 text strings, byte strings,
- * booleans and null. Indefinite lengths, floats, tags and bigints are rejected
- * loudly — extending the subset means revisiting D2.
+ * Deliberately covers ONLY what SMP needs: maps and arrays (definite-length on
+ * encode; both definite- and indefinite-length on decode — Zephyr's zcbor in its
+ * default non-canonical mode emits every SMP response map/array as an
+ * indefinite-length item closed by a 0xff break byte), unsigned/negative
+ * integers up to 2^53-1, UTF-8 text strings, byte strings, booleans and null.
+ * Indefinite-length (chunked) strings, floats, tags and bigints are rejected
+ * loudly — extending the subset means revisiting D2 (already revised once for
+ * indefinite-length containers, 2026-08-11).
  */
 
 export type CborValue =
@@ -23,6 +27,11 @@ const MT_BYTES = 2
 const MT_TEXT = 3
 const MT_ARRAY = 4
 const MT_MAP = 5
+
+// Additional-info value 31: indefinite length on containers, and (with major
+// type 7) the 0xff break byte that terminates an indefinite-length item.
+const INFO_INDEFINITE = 31
+const BREAK_BYTE = 0xff
 
 export function cborEncode(value: CborValue): Uint8Array {
   const out: number[] = []
@@ -128,8 +137,26 @@ class CborReader {
       if (!Number.isSafeInteger(value)) throw new Error("CBOR: uint64 exceeds safe integer range")
       return value
     }
-    // 28–30 reserved, 31 = indefinite length — none are in the SMP subset.
+    // 28–30 reserved, 31 = indefinite length. Indefinite CONTAINERS are handled
+    // in readValue before this is called; reaching here with 31 means a chunked
+    // string (or indefinite-length integer nonsense) — not in the SMP subset.
     throw new Error(`CBOR: unsupported additional info ${info}`)
+  }
+
+  /** Consume the 0xff break byte if it is next; false means an item follows. */
+  private tryTakeBreak(): boolean {
+    if (this.pos >= this.bytes.length) throw new Error("CBOR: unexpected end of input")
+    if (this.bytes[this.pos] === BREAK_BYTE) {
+      this.pos++
+      return true
+    }
+    return false
+  }
+
+  private readMapEntry(map: { [key: string]: CborValue }): void {
+    const key = this.readValue()
+    if (typeof key !== "string") throw new Error("CBOR: unsupported non-text map key")
+    map[key] = this.readValue()
   }
 
   readValue(): CborValue {
@@ -147,19 +174,23 @@ class CborReader {
       case MT_TEXT:
         return new TextDecoder().decode(this.takeBytes(this.readArg(info)))
       case MT_ARRAY: {
-        const length = this.readArg(info)
         const items: CborValue[] = []
+        if (info === INFO_INDEFINITE) {
+          while (!this.tryTakeBreak()) items.push(this.readValue())
+          return items
+        }
+        const length = this.readArg(info)
         for (let i = 0; i < length; i++) items.push(this.readValue())
         return items
       }
       case MT_MAP: {
-        const length = this.readArg(info)
         const map: { [key: string]: CborValue } = {}
-        for (let i = 0; i < length; i++) {
-          const key = this.readValue()
-          if (typeof key !== "string") throw new Error("CBOR: unsupported non-text map key")
-          map[key] = this.readValue()
+        if (info === INFO_INDEFINITE) {
+          while (!this.tryTakeBreak()) this.readMapEntry(map)
+          return map
         }
+        const length = this.readArg(info)
+        for (let i = 0; i < length; i++) this.readMapEntry(map)
         return map
       }
       default:
@@ -167,6 +198,9 @@ class CborReader {
         if (major === 7 && info === 20) return false
         if (major === 7 && info === 21) return true
         if (major === 7 && info === 22) return null
+        if (major === 7 && info === INFO_INDEFINITE) {
+          throw new Error("CBOR: break byte (0xff) outside an indefinite-length item")
+        }
         throw new Error(`CBOR: unsupported item (major type ${major}, info ${info})`)
     }
   }

@@ -74,8 +74,38 @@ describe("cborDecode", () => {
     expect(() => cborDecode(fromHex("6449455446".slice(0, 6)))).toThrow(/end of input/)
   })
 
-  it("rejects indefinite lengths (not in the SMP subset)", () => {
-    expect(() => cborDecode(fromHex("9fff"))).toThrow(/unsupported/)
+  // Zephyr's zcbor encoder (non-canonical, the firmware default) opens every SMP
+  // response map/array as an indefinite-length item closed by a 0xff break byte —
+  // the decoder must accept those. Vectors from RFC 8949 Appendix A plus an
+  // SMP-shaped echo response.
+  const INDEFINITE_VECTORS: Array<[string, CborValue]> = [
+    ["9fff", []],
+    ["bfff", {}],
+    ["9f018202039f0405ffff", [1, [2, 3], [4, 5]]],
+    ["bf61610161629f0203ffff", { a: 1, b: [2, 3] }],
+    ["bf61726568656c6c6fff", { r: "hello" }],
+  ]
+
+  it.each(INDEFINITE_VECTORS)("decodes indefinite-length %s", (encoded, value) => {
+    expect(cborDecode(fromHex(encoded))).toEqual(value)
+  })
+
+  it("rejects indefinite-length text strings (zcbor never chunks strings)", () => {
+    // (_ "strea", "ming") — RFC 8949 Appendix A
+    expect(() => cborDecode(fromHex("7f657374726561646d696e67ff"))).toThrow(/unsupported/)
+  })
+
+  it("rejects indefinite-length byte strings (zcbor never chunks strings)", () => {
+    // (_ h'0102', h'030405') — RFC 8949 Appendix A
+    expect(() => cborDecode(fromHex("5f42010243030405ff"))).toThrow(/unsupported/)
+  })
+
+  it("rejects a break byte outside an indefinite-length item", () => {
+    expect(() => cborDecode(fromHex("ff"))).toThrow(/break/)
+  })
+
+  it("rejects an unterminated indefinite-length map", () => {
+    expect(() => cborDecode(fromHex("bf616101"))).toThrow(/end of input/)
   })
 
   it("rejects floats (not in the SMP subset)", () => {
