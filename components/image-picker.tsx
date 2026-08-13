@@ -7,9 +7,15 @@
  * local files are also saved to the library so they can be re-flashed later.
  */
 
-import { useEffect, useState, type ChangeEvent } from "react"
+import { useEffect, useRef, useState, type ChangeEvent } from "react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { ChevronDown, FileUp } from "lucide-react"
 import { parseMcubootImage, type McubootImageInfo } from "@/lib/smp/mcuboot"
 import { deleteImage, getImageBytes, listImages, saveImage, type StoredImage } from "@/lib/firmware-library"
 import type { ShelfEntry } from "@/lib/firmware-shelf"
@@ -29,6 +35,29 @@ const STATUS_LABEL: Record<Exclude<ShelfEntry["status"], "ok">, string> = {
   unlisted: "not in the manifest",
 }
 
+/**
+ * Shelf entries grouped by version step ("0.1", "0.2", …) — one dropdown per
+ * step. Unparsable versions (unlisted bins report "?") collect under "Other",
+ * which sorts last; numeric steps sort ascending. Manifest order is kept
+ * within a group.
+ */
+function groupShelfByStep(shelf: ShelfEntry[]): Array<[string, ShelfEntry[]]> {
+  const groups = new Map<string, ShelfEntry[]>()
+  for (const entry of shelf) {
+    const step = entry.version.match(/^(\d+\.\d+)/)?.[1] ?? "Other"
+    const list = groups.get(step)
+    if (list) list.push(entry)
+    else groups.set(step, [entry])
+  }
+  return [...groups.entries()].sort(([a], [b]) => {
+    if (a === "Other") return 1
+    if (b === "Other") return -1
+    const [aMajor, aMinor] = a.split(".").map(Number)
+    const [bMajor, bMinor] = b.split(".").map(Number)
+    return aMajor - bMajor || aMinor - bMinor
+  })
+}
+
 export function ImagePicker({ disabled, onImage }: ImagePickerProps) {
   const [shelf, setShelf] = useState<ShelfEntry[]>([])
   const [shelfError, setShelfError] = useState("")
@@ -38,6 +67,7 @@ export function ImagePicker({ disabled, onImage }: ImagePickerProps) {
   // explicit in the error line (see failPick). The card stays the sole owner of
   // the real selection; this never drives what gets flashed.
   const [selectedLabel, setSelectedLabel] = useState("")
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
     void refreshShelf()
@@ -166,29 +196,41 @@ export function ImagePicker({ disabled, onImage }: ImagePickerProps) {
 
   return (
     <div className="space-y-3">
-      <div>
+      <div className="space-y-1">
         <div className="text-sm font-medium">Version shelf (firmware repo)</div>
         {shelfError && <div className="text-sm text-muted-foreground">{shelfError}</div>}
-        {shelf.map((entry, index) => (
-          // A manifest may list the same file twice, so the file name alone is
-          // not a unique React key.
-          <div key={`${entry.file}-${index}`} className="flex items-center justify-between gap-2 py-1 text-sm">
-            <span>
-              v{entry.version} — {entry.description}
-              {entry.status !== "ok" && (
-                <span className="text-destructive"> [{STATUS_LABEL[entry.status]}]</span>
-              )}
-            </span>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={disabled || entry.status === "missing-file"}
-              onClick={() => void pickShelf(entry)}
-            >
-              Select
-            </Button>
+        {shelf.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {groupShelfByStep(shelf).map(([step, entries]) => (
+              <DropdownMenu key={step}>
+                <DropdownMenuTrigger asChild>
+                  <Button size="sm" variant="outline" disabled={disabled}>
+                    {step === "Other" ? "Other" : `v${step}.x`}
+                    <ChevronDown className="ml-1 h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start">
+                  {entries.map((entry, index) => (
+                    // A manifest may list the same file twice, so the file name
+                    // alone is not a unique React key.
+                    <DropdownMenuItem
+                      key={`${entry.file}-${index}`}
+                      disabled={entry.status === "missing-file"}
+                      onSelect={() => void pickShelf(entry)}
+                    >
+                      <span>
+                        v{entry.version} — {entry.description}
+                        {entry.status !== "ok" && (
+                          <span className="text-destructive"> [{STATUS_LABEL[entry.status]}]</span>
+                        )}
+                      </span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ))}
           </div>
-        ))}
+        )}
       </div>
       <div>
         <div className="text-sm font-medium">Previously uploaded</div>
@@ -209,9 +251,21 @@ export function ImagePicker({ disabled, onImage }: ImagePickerProps) {
           </div>
         ))}
       </div>
-      <div>
+      <div className="space-y-1">
         <div className="text-sm font-medium">Upload a .bin</div>
-        <Input type="file" accept=".bin" disabled={disabled} onChange={(e) => void pickFile(e)} />
+        {/* Hidden native input; the visible control is a real Button so it matches
+            the rest of the UI instead of the browser's locale-styled file widget. */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".bin"
+          className="hidden"
+          onChange={(e) => void pickFile(e)}
+        />
+        <Button size="sm" variant="outline" disabled={disabled} onClick={() => fileInputRef.current?.click()}>
+          <FileUp className="mr-1 h-4 w-4" />
+          Choose a .bin file…
+        </Button>
       </div>
       {sourceError && <div className="text-sm text-destructive">{sourceError}</div>}
     </div>
