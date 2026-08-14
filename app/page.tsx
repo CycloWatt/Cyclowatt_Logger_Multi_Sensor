@@ -78,7 +78,10 @@ export default function BluetoothDataLogger() {
   const [isSecureContext, setIsSecureContext] = useState<boolean>(true)
   const [availableDevices, setAvailableDevices] = useState<AvailableDevice[]>([])
   const [isScanning, setIsScanning] = useState(false)
-  const [useUuidFilter, setUseUuidFilter] = useState(false)
+  // Narrows the chooser to CycloWatt boards by name prefix. Was a service-UUID
+  // filter until firmware v0.6.0 stopped advertising the raw-stream UUID; renamed
+  // so it no longer claims to filter on something that is not on air.
+  const [useDeviceFilter, setUseDeviceFilter] = useState(false)
   // "normal" = raw-stream logging session; "dfu" = firmware-update-only session.
   // DFU-only mode exists because prod images don't advertise the raw-stream service
   // (decision D1) — without it, a board flashed to prod could never be reached again.
@@ -599,16 +602,30 @@ export default function BluetoothDataLogger() {
       setIsScanning(true)
       setError("")
       console.log("\n🔍 SCANNING FOR BLUETOOTH DEVICES...")
-      console.log("Target Service UUID:", CYCLOWATT_SERVICE_UUID)
-      console.log("UUID Filtering:", useUuidFilter ? "ENABLED" : "DISABLED")
+      console.log("Target Service UUID (post-connect):", CYCLOWATT_SERVICE_UUID)
+      console.log("Name-prefix filtering:", useDeviceFilter ? "ENABLED (Cyclowatt*, CycloRaw*)" : "DISABLED")
 
       // Chrome only lets a page talk to services declared at requestDevice time —
       // the SMP (DFU) service must be in optionalServices on EVERY connect path or
       // the DFU card can't reach it later (decision D1).
-      const requestOptions: RequestDeviceOptions = useUuidFilter
+      //
+      // The filtered branch matches device-name PREFIXES, not the raw-stream service
+      // UUID. Chrome's chooser can only match ADVERTISED data, and firmware v0.6.0
+      // stopped advertising that UUID — it was consuming the DAQ scan-response budget
+      // and truncating DAQ names on air — so a `services` filter would now match
+      // nothing at all. Same prefixes as the DFU-only path below. The UUID moves into
+      // optionalServices: a name filter grants no service access on its own, and
+      // post-connect access never depended on the advertisement.
+      const requestOptions: RequestDeviceOptions = useDeviceFilter
         ? {
-            filters: [{ services: [CYCLOWATT_SERVICE_UUID] }],
-            optionalServices: [SMP_SERVICE_UUID, "battery_service", "generic_access", "generic_attribute"],
+            filters: [{ namePrefix: "Cyclowatt" }, { namePrefix: "CycloRaw" }],
+            optionalServices: [
+              CYCLOWATT_SERVICE_UUID,
+              SMP_SERVICE_UUID,
+              "battery_service",
+              "generic_access",
+              "generic_attribute",
+            ],
           }
         : {
             acceptAllDevices: true,
@@ -1311,16 +1328,16 @@ export default function BluetoothDataLogger() {
               <CardContent className="space-y-4">
                 <div className="flex items-center space-x-2 p-3 bg-gray-50 border border-gray-200 rounded-lg">
                   <Switch
-                    id="uuid-filter"
-                    checked={useUuidFilter}
-                    onCheckedChange={setUseUuidFilter}
+                    id="device-filter"
+                    checked={useDeviceFilter}
+                    onCheckedChange={setUseDeviceFilter}
                     disabled={isConnected}
                   />
-                  <Label htmlFor="uuid-filter" className="cursor-pointer">
-                    <div className="font-medium">Filter by CycloWatt Service UUID</div>
+                  <Label htmlFor="device-filter" className="cursor-pointer">
+                    <div className="font-medium">Show only CycloWatt boards</div>
                     <div className="text-xs text-gray-500">
-                      {useUuidFilter
-                        ? "Only devices advertising the CycloWatt service will appear"
+                      {useDeviceFilter
+                        ? "Only devices named Cyclowatt… or CycloRaw… will appear"
                         : "All Bluetooth devices will appear in the scan"}
                     </div>
                   </Label>
