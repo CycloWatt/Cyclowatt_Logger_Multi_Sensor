@@ -12,7 +12,7 @@ import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
 import type { RequestDeviceOptions } from "web-bluetooth"
 import { SMP_SERVICE_UUID } from "@/lib/smp/client"
-import { firmwareVersionFromName } from "@/lib/device-name"
+import { BOARD_NAME_PREFIXES, BOARD_NAME_PREFIX_HINT, firmwareVersionFromName } from "@/lib/device-name"
 import { DfuCard } from "@/components/dfu-card"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 
@@ -78,9 +78,9 @@ export default function BluetoothDataLogger() {
   const [isSecureContext, setIsSecureContext] = useState<boolean>(true)
   const [availableDevices, setAvailableDevices] = useState<AvailableDevice[]>([])
   const [isScanning, setIsScanning] = useState(false)
-  // Narrows the chooser to CycloWatt boards by name prefix. Was a service-UUID
-  // filter until firmware v0.6.0 stopped advertising the raw-stream UUID; renamed
-  // so it no longer claims to filter on something that is not on air.
+  // Narrows the chooser to CycloWatt boards by name prefix. Was a raw-stream
+  // service-UUID filter, which could only ever find DAQ boards - prod images do not
+  // advertise that service; renamed so it no longer claims to filter on a UUID.
   const [useDeviceFilter, setUseDeviceFilter] = useState(false)
   // "normal" = raw-stream logging session; "dfu" = firmware-update-only session.
   // DFU-only mode exists because prod images don't advertise the raw-stream service
@@ -271,32 +271,40 @@ export default function BluetoothDataLogger() {
       label: "Shear Ch 5",
       color: "hsl(var(--chart-3))",
     },
+    // Units below follow the firmware's wire contract: it packs accel in milli-g
+    // and gyro in milli-rad/s, and parseDataPacket divides both by 1000. So these
+    // traces are g and rad/s - NOT the m/s2 and deg/s they were labelled as.
     accelX: {
-      label: "Accel X (m/s²)",
+      label: "Accel X (g)",
       color: "hsl(var(--chart-2))",
     },
     accelY: {
-      label: "Accel Y (m/s²)",
+      label: "Accel Y (g)",
       color: "hsl(var(--chart-3))",
     },
     accelZ: {
-      label: "Accel Z (m/s²)",
+      label: "Accel Z (g)",
       color: "hsl(var(--chart-4))",
     },
     gyroX: {
-      label: "Gyro X (°/s)",
+      label: "Gyro X (rad/s)",
       color: "hsl(var(--chart-5))",
     },
     gyroY: {
-      label: "Gyro Y (°/s)",
+      label: "Gyro Y (rad/s)",
       color: "hsl(220, 70%, 50%)",
     },
     gyroZ: {
-      label: "Gyro Z (°/s)",
+      label: "Gyro Z (rad/s)",
       color: "hsl(280, 70%, 50%)",
     },
+    // Slot 12 of the capture packet is a frozen zero-fill field, not a reading. The
+    // on-board estimator produces power per crank REVOLUTION, so there is no
+    // per-sample value to pack; power for a capture is computed from the channels
+    // offline. The trace is kept (the slot is still parsed and exported) but must
+    // not read as a measurement - it is a flat zero line by design.
     power: {
-      label: "Power (W)",
+      label: "Board Power (unused - always 0)",
       color: "hsl(45, 90%, 50%)",
     },
     referencePower: {
@@ -603,22 +611,25 @@ export default function BluetoothDataLogger() {
       setError("")
       console.log("\n🔍 SCANNING FOR BLUETOOTH DEVICES...")
       console.log("Target Service UUID (post-connect):", CYCLOWATT_SERVICE_UUID)
-      console.log("Name-prefix filtering:", useDeviceFilter ? "ENABLED (Cyclowatt*, CycloRaw*)" : "DISABLED")
+      console.log("Name-prefix filtering:", useDeviceFilter ? `ENABLED (${BOARD_NAME_PREFIX_HINT})` : "DISABLED")
 
       // Chrome only lets a page talk to services declared at requestDevice time —
       // the SMP (DFU) service must be in optionalServices on EVERY connect path or
       // the DFU card can't reach it later (decision D1).
       //
       // The filtered branch matches device-name PREFIXES, not the raw-stream service
-      // UUID. Chrome's chooser can only match ADVERTISED data, and firmware v0.6.0
-      // stopped advertising that UUID — it was consuming the DAQ scan-response budget
-      // and truncating DAQ names on air — so a `services` filter would now match
-      // nothing at all. Same prefixes as the DFU-only path below. The UUID moves into
-      // optionalServices: a name filter grants no service access on its own, and
-      // post-connect access never depended on the advertisement.
+      // UUID, for the same reason the DFU-only path below does: a services filter can
+      // only ever find DAQ boards, because prod images do not advertise the raw-stream
+      // service at all. Name prefixes reach both images with one filter list.
+      //
+      // The DAQ image DOES still advertise that UUID and must keep doing so - it is
+      // the capture dongle's only match key - so this is not a workaround for a
+      // missing advertisement. But the UUID still has to move into optionalServices:
+      // a name filter grants no service access on its own, so without it the chooser
+      // would work and raw-stream logging would fail right after connecting.
       const requestOptions: RequestDeviceOptions = useDeviceFilter
         ? {
-            filters: [{ namePrefix: "Cyclowatt" }, { namePrefix: "CycloRaw" }],
+            filters: BOARD_NAME_PREFIXES.map((namePrefix) => ({ namePrefix })),
             optionalServices: [
               CYCLOWATT_SERVICE_UUID,
               SMP_SERVICE_UUID,
@@ -878,16 +889,16 @@ export default function BluetoothDataLogger() {
   // DFU-only connect mode (decision D1). Prod images don't advertise the raw-stream
   // service, and the SMP service isn't in ANY variant's advertising payload (Chrome
   // chooser filters match advertised data only) — so the chooser filters on the
-  // device-name PREFIXES the firmware uses: "Cyclowatt"* for prod images and
-  // "CycloRaw"* for DAQ images. Names carry a " v<version>" suffix (e.g.
-  // "Cyclowatt L v0.1.1"); the DAQ scan response may truncate it, but the base
-  // prefix always survives, so namePrefix matching is unaffected.
+  // device-name PREFIXES the firmware uses (BOARD_NAME_PREFIXES owns the list and
+  // the reason each entry is in it). Names carry a " v<version>" suffix, and a DAQ
+  // board's 11-char on-air name truncates it away, but the base prefix always
+  // survives, so namePrefix matching is unaffected.
   const connectDfuOnly = async () => {
     try {
       setError("")
       console.log("\n🔧 CONNECTING IN DFU-ONLY MODE...")
       const dfuDevice = await navigator.bluetooth.requestDevice({
-        filters: [{ namePrefix: "Cyclowatt" }, { namePrefix: "CycloRaw" }],
+        filters: BOARD_NAME_PREFIXES.map((namePrefix) => ({ namePrefix })),
         optionalServices: [
           SMP_SERVICE_UUID,
           CYCLOWATT_SERVICE_UUID,
@@ -923,17 +934,18 @@ export default function BluetoothDataLogger() {
       const force4 = dataView.getInt32(16, true) // index 4 — compression
       const force5 = dataView.getInt32(20, true) // index 5 — shear
 
-      // Accel — scaled by 1000
+      // Accel — packed as milli-g, so /1000 yields g
       const accelX = dataView.getInt32(24, true) / 1000 // index 6
       const accelY = dataView.getInt32(28, true) / 1000 // index 7
       const accelZ = dataView.getInt32(32, true) / 1000 // index 8
 
-      // Gyro — scaled by 1000
+      // Gyro — packed as milli-rad/s, so /1000 yields rad/s
       const gyroX = dataView.getInt32(36, true) / 1000 // index 9
       const gyroY = dataView.getInt32(40, true) / 1000 // index 10
       const gyroZ = dataView.getInt32(44, true) / 1000 // index 11
 
-      // Power — raw integer
+      // Power — frozen zero-fill slot, never a reading (see chartConfig.power).
+      // Parsed and exported anyway so the CSV column set stays stable.
       const power = dataView.getInt32(48, true) // index 12
 
       // Tick — raw integer
@@ -968,7 +980,7 @@ export default function BluetoothDataLogger() {
       const timestamp = new Date().toISOString()
       console.log(`📦 [${timestamp}] Packet #${packetCountRef.current + 1} tick=${tick} ticksMcu=${ticksMcu}`)
       console.log(
-        `📊 [${timestamp}] Force=[${force0}, ${force1}, ${force2}, ${force3}, ${force4}, ${force5}] Power=${power}W`,
+        `📊 [${timestamp}] Force=[${force0}, ${force1}, ${force2}, ${force3}, ${force4}, ${force5}] PowerSlot=${power}`,
       )
       console.log(
         `🔄 [${timestamp}] Accel=[${accelX}, ${accelY}, ${accelZ}] Gyro=[${gyroX}, ${gyroY}, ${gyroZ}] Sync=${serialValueRef.current}`,
@@ -1337,7 +1349,7 @@ export default function BluetoothDataLogger() {
                     <div className="font-medium">Show only CycloWatt boards</div>
                     <div className="text-xs text-gray-500">
                       {useDeviceFilter
-                        ? "Only devices named Cyclowatt… or CycloRaw… will appear"
+                        ? `Only devices named ${BOARD_NAME_PREFIX_HINT} will appear`
                         : "All Bluetooth devices will appear in the scan"}
                     </div>
                   </Label>
@@ -1629,7 +1641,7 @@ export default function BluetoothDataLogger() {
                 {/* Acceleration Chart */}
                 <Card className="bg-white border-gray-200">
                   <CardHeader className="flex flex-row items-center justify-between">
-                    <CardTitle>Acceleration Data (m/s²)</CardTitle>
+                    <CardTitle>Acceleration Data (g)</CardTitle>
                     <Button
                       variant="outline"
                       size="sm"
@@ -1713,7 +1725,7 @@ export default function BluetoothDataLogger() {
                 {/* Gyroscope Chart */}
                 <Card className="bg-white border-gray-200">
                   <CardHeader className="flex flex-row items-center justify-between">
-                    <CardTitle>Gyroscope Data (°/s)</CardTitle>
+                    <CardTitle>Gyroscope Data (rad/s)</CardTitle>
                     <Button
                       variant="outline"
                       size="sm"
@@ -1797,7 +1809,7 @@ export default function BluetoothDataLogger() {
                 {/* Power Chart */}
                 <Card className="bg-white border-gray-200">
                   <CardHeader className="flex flex-row items-center justify-between">
-                    <CardTitle>Power Data (W) — CycloWatt vs Reference</CardTitle>
+                    <CardTitle>Power Data (W) — Reference meter (board power unused)</CardTitle>
                     <Button
                       variant="outline"
                       size="sm"
