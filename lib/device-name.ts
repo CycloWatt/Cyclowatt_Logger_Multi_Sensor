@@ -36,6 +36,25 @@ export const BOARD_NAME_PREFIXES = ["Cyclowatt", "CRaw", "CycloRaw"] as const
 export const BOARD_NAME_PREFIX_HINT = BOARD_NAME_PREFIXES.map((prefix) => `${prefix}...`).join(", ")
 
 /**
+ * Is this advertised name one of OUR boards?
+ *
+ * The mirror image of the chooser filter: the same list that decides which devices
+ * to OFFER for a firmware update decides which to KEEP OUT of the reference
+ * power-meter flow. Our boards advertise the standard Cycling Power service
+ * (0x1818) exactly as a commercial meter does, so a service filter alone cannot
+ * tell a CycloWatt board apart from the SRM being measured against - the name is
+ * the only discriminator Chrome exposes before a connection exists.
+ *
+ * Deriving both from BOARD_NAME_PREFIXES is the point: a future base rename moves
+ * the chooser and this guard together, instead of leaving one of them silently
+ * matching a name no board uses any more.
+ */
+export function isBoardName(name: string | null | undefined): boolean {
+  if (!name) return false
+  return BOARD_NAME_PREFIXES.some((prefix) => name.startsWith(prefix))
+}
+
+/**
  * Extract the firmware version from an advertised or GAP device name, so bench
  * captures are attributable to a build.
  *

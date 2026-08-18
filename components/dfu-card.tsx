@@ -10,10 +10,12 @@ import { DevicePanel } from "@/components/device-panel"
 import { ImagePicker } from "@/components/image-picker"
 import {
   appendFlashRecord,
+  clearFlashHistory,
   readFlashHistory,
   throughputKbps,
   type FlashRecord,
 } from "@/lib/flash-history"
+import { readGapDeviceName } from "@/lib/gap-name"
 import { type ImageSlotState, type SmpClient } from "@/lib/smp/client"
 import { openSmpClient } from "@/lib/smp/gatt"
 import { type McubootImageInfo } from "@/lib/smp/mcuboot"
@@ -23,6 +25,16 @@ interface DfuCardProps {
   device: BluetoothDevice | null
   isStreaming: boolean
   stopStreaming: () => Promise<void>
+  // The page's best current name for `device`, read from the board's own Device
+  // Name characteristic. Passed in rather than read off BluetoothDevice.name,
+  // which Chrome freezes at grant time (see lib/device-list.ts) and which on a
+  // board flashed since the grant names the OLD build.
+  deviceName?: string | null
+  // Reports the board's name back up after a flash has renamed it. The post-reset
+  // reconnect below is the first moment the NEW name is readable, and the page
+  // cannot see it on its own: the BluetoothDevice object is unchanged, so nothing
+  // there re-renders.
+  onDeviceName?: (name: string) => void
 }
 
 // One user-visible phase per step of the flash flow; drives status text and buttons.
@@ -47,7 +59,7 @@ const PHASE_TEXT: Record<DfuPhase, string> = {
   error: "",
 }
 
-export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
+export function DfuCard({ device, isStreaming, stopStreaming, deviceName, onDeviceName }: DfuCardProps) {
   const [fileName, setFileName] = useState("")
   const [fileInfo, setFileInfo] = useState<McubootImageInfo | null>(null)
   const [phase, setPhase] = useState<DfuPhase>("idle")
@@ -66,6 +78,10 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
   // state on disconnect, but resume and the post-reset reconnect need this exact
   // BluetoothDevice object (a retained device reconnects without a new chooser).
   const deviceRef = useRef<BluetoothDevice | null>(null)
+  // The freshest name this card has read off the board itself, which after a
+  // successful flash is newer than anything the page can know. A ref because
+  // recordFlash is called from paths that must not wait for a re-render.
+  const gapNameRef = useRef<string | null>(null)
 
   const busy =
     phase === "starting" || phase === "uploading" || phase === "activating" || phase === "reconnecting"
@@ -89,7 +105,9 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
     flashStartRef.current = null
     appendFlashRecord({
       deviceId: deviceRef.current?.id ?? "unknown",
-      deviceName: deviceRef.current?.name ?? "unknown",
+      // Name preference is strictly freshest-first. deviceRef.current.name is the
+      // last resort precisely because it is the one value that never updates.
+      deviceName: gapNameRef.current ?? deviceName ?? deviceRef.current?.name ?? "unknown",
       version: fileInfo?.version ?? "?",
       startedAt,
       durationMs: Date.now() - startedAt,
@@ -186,6 +204,15 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
       // MCUboot copies the image into the primary slot before the app boots —
       // allow generous time before giving up (a ~318 KB copy plus boot).
       await reconnectWithRetry(target, 120000)
+      // The board is now running the flashed image, so its GAP name carries the
+      // NEW version suffix. Read it here, while the link is up and before the
+      // finally below drops it: this is the only moment the new name is
+      // obtainable, and both the flash record and the page's device list want it.
+      const flashedName = await readGapDeviceName(target)
+      if (flashedName) {
+        gapNameRef.current = flashedName
+        onDeviceName?.(flashedName)
+      }
       const verifyClient = await openSmpClient(target)
       try {
         const booted = (await verifyClient.imageStateRead()).find((s: ImageSlotState) => s.active)
@@ -362,7 +389,23 @@ export function DfuCard({ device, isStreaming, stopStreaming }: DfuCardProps) {
         */}
         {history.length > 0 && (
           <div className="space-y-1">
-            <div className="text-sm font-medium">Flash history (end-to-end)</div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-sm font-medium">Flash history (end-to-end)</div>
+              {/*
+                Disabled mid-flash for the same reason as the bench controls: the
+                run in flight is about to append a record, and clearing underneath
+                it would leave the log looking like the clear had failed. The whole
+                block is gated on a non-empty log, so this button removes itself.
+              */}
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={busy}
+                onClick={() => setHistory(clearFlashHistory())}
+              >
+                Clear
+              </Button>
+            </div>
             {history.slice(0, 5).map((r) => (
               // startedAt alone can collide only in the conceivable same-millisecond
               // pair, so the outcome and the board join the key.

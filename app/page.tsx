@@ -1,23 +1,64 @@
 "use client"
 
-import { useState, useRef, useEffect } from "react"
+import { useState, useRef, useEffect, useCallback } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Brush } from "recharts"
-import { ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart"
+import { type ChartConfig } from "@/components/ui/chart"
 import { Download, Wifi, WifiOff, AlertTriangle, Search, Cable } from "lucide-react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
-import type { RequestDeviceOptions } from "web-bluetooth"
+import { SensorChartCard, isZoomed, type ChartLineDef, type ZoomRange } from "@/components/sensor-chart-card"
 import { SMP_SERVICE_UUID } from "@/lib/smp/client"
-import { BOARD_NAME_PREFIXES, BOARD_NAME_PREFIX_HINT, firmwareVersionFromName } from "@/lib/device-name"
+import { BOARD_NAME_PREFIXES, BOARD_NAME_PREFIX_HINT, firmwareVersionFromName, isBoardName } from "@/lib/device-name"
+import { applyDeviceName, nextDisplayName } from "@/lib/device-list"
+import { readGapDeviceName } from "@/lib/gap-name"
 import { DfuCard } from "@/components/dfu-card"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 
+// Per-packet console output (3 lines per packet at streaming rate, i.e.
+// hundreds of lines/s). With DevTools open this was the single largest CPU
+// cost of a capture, and the log strings were built even with DevTools closed.
+// Flip to true only when actually debugging the packet stream.
+const DEBUG_PACKET_LOG = false
+
+// One localStorage record for the bench switches (CSV capture, chooser
+// filter), so a page reload keeps the operator's setup. Same store-and-key
+// style as the flash history ("cyclowatt-flash-history").
+const PREFS_KEY = "cyclowatt-bench-prefs"
+
+interface BenchPrefs {
+  csvCaptureEnabled?: boolean
+  useDeviceFilter?: boolean
+}
+
+// Read/write are both best-effort: localStorage can throw (blocked cookies,
+// storage-restricted embeds), and prefs must never take the logger down.
+function readBenchPrefs(): BenchPrefs {
+  try {
+    const raw = window.localStorage.getItem(PREFS_KEY)
+    if (!raw) return {}
+    const parsed: unknown = JSON.parse(raw)
+    return typeof parsed === "object" && parsed !== null ? (parsed as BenchPrefs) : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeBenchPrefs(update: Partial<BenchPrefs>): void {
+  try {
+    window.localStorage.setItem(PREFS_KEY, JSON.stringify({ ...readBenchPrefs(), ...update }))
+  } catch {
+    // non-fatal - the switch still works for this session
+  }
+}
+
 interface DataPoint {
   timestamp: number
+  // Pre-formatted chart label for `timestamp`. Formatted ONCE here at parse
+  // time: formatting on every chart tick meant 500 Intl calls per 100 ms.
+  timeLabel: string
   tick: number
   ticksMcu: number
   force0: number
@@ -37,7 +78,10 @@ interface DataPoint {
   synchronization: number
 }
 
-interface ChartDataPoint {
+// A type alias, not an interface, on purpose: aliases get TypeScript's implicit
+// index signature, which lets ChartDataPoint[] flow into the chart card's
+// generic Record-typed data prop without casts.
+type ChartDataPoint = {
   time: string
   force0: number
   force1: number
@@ -65,7 +109,112 @@ interface AvailableDevice {
   // than from a fresh chooser pick, so the row can say so: it is a permission
   // record, NOT evidence the board is powered on or in range right now.
   remembered: boolean
+  // true = an advertisement from this device has been SEEN this page session
+  // (via watchAdvertisements, where the engine supports it) - upgrades the
+  // "(remembered)" caveat to positive evidence the board is on and in range.
+  // Latched, deliberately: it means "seen since load", not "seen just now".
+  inRange?: boolean
 }
+
+// Chart styling/labels and the five charts' line sets, at module scope so the
+// memoized chart cards receive the SAME object every render - rebuilding these
+// per render would defeat the memo and re-render five recharts trees on every
+// unrelated state change (serial line, battery update, reference power).
+const CHART_CONFIG = {
+  force0: {
+    label: "Compression Ch 0",
+    color: "hsl(var(--chart-1))",
+  },
+  force2: {
+    label: "Compression Ch 2",
+    color: "hsl(var(--chart-2))",
+  },
+  force4: {
+    label: "Compression Ch 4",
+    color: "hsl(var(--chart-3))",
+  },
+  force1: {
+    label: "Shear Ch 1",
+    color: "hsl(var(--chart-1))",
+  },
+  force3: {
+    label: "Shear Ch 3",
+    color: "hsl(var(--chart-2))",
+  },
+  force5: {
+    label: "Shear Ch 5",
+    color: "hsl(var(--chart-3))",
+  },
+  // Units below follow the firmware's wire contract: it packs accel in milli-g
+  // and gyro in milli-rad/s, and parseDataPacket divides both by 1000. So these
+  // traces are g and rad/s - NOT the m/s2 and deg/s they were labelled as.
+  accelX: {
+    label: "Accel X (g)",
+    color: "hsl(var(--chart-2))",
+  },
+  accelY: {
+    label: "Accel Y (g)",
+    color: "hsl(var(--chart-3))",
+  },
+  accelZ: {
+    label: "Accel Z (g)",
+    color: "hsl(var(--chart-4))",
+  },
+  gyroX: {
+    label: "Gyro X (rad/s)",
+    color: "hsl(var(--chart-5))",
+  },
+  gyroY: {
+    label: "Gyro Y (rad/s)",
+    color: "hsl(220, 70%, 50%)",
+  },
+  gyroZ: {
+    label: "Gyro Z (rad/s)",
+    color: "hsl(280, 70%, 50%)",
+  },
+  // Slot 12 of the capture packet is a frozen zero-fill field, not a reading. The
+  // on-board estimator produces power per crank REVOLUTION, so there is no
+  // per-sample value to pack; power for a capture is computed from the channels
+  // offline. The trace is kept (the slot is still parsed and exported) but must
+  // not read as a measurement - it is a flat zero line by design.
+  power: {
+    label: "Board Power (unused - always 0)",
+    color: "hsl(45, 90%, 50%)",
+  },
+  referencePower: {
+    label: "Reference Power (W)",
+    color: "hsl(200, 80%, 45%)",
+  },
+  synchronization: {
+    label: "Sync",
+    color: "hsl(var(--chart-1))",
+  },
+} satisfies ChartConfig
+
+const COMPRESSION_LINES: readonly ChartLineDef[] = [
+  { dataKey: "force0", name: "Channel 0" },
+  { dataKey: "force2", name: "Channel 2" },
+  { dataKey: "force4", name: "Channel 4" },
+]
+const SHEAR_LINES: readonly ChartLineDef[] = [
+  { dataKey: "force1", name: "Channel 1" },
+  { dataKey: "force3", name: "Channel 3" },
+  { dataKey: "force5", name: "Channel 5" },
+]
+const ACCEL_LINES: readonly ChartLineDef[] = [
+  { dataKey: "accelX", name: "Accel X" },
+  { dataKey: "accelY", name: "Accel Y" },
+  { dataKey: "accelZ", name: "Accel Z" },
+]
+const GYRO_LINES: readonly ChartLineDef[] = [
+  { dataKey: "gyroX", name: "Gyro X" },
+  { dataKey: "gyroY", name: "Gyro Y" },
+  { dataKey: "gyroZ", name: "Gyro Z" },
+]
+const POWER_LINES: readonly ChartLineDef[] = [
+  { dataKey: "power", name: "CycloWatt Power" },
+  { dataKey: "referencePower", name: "Reference Power" },
+]
 
 export default function BluetoothDataLogger() {
   const [isConnected, setIsConnected] = useState(false)
@@ -92,9 +241,21 @@ export default function BluetoothDataLogger() {
   // Firmware version parsed from the device name, LATCHED at connect time so a CSV
   // exported after the link is gone still carries the build it was captured on. It
   // deliberately outlives the session (handleDisconnection nulls `device` while
-  // allData survives and Export stays enabled), and is overwritten by the next
+  // the recording survives and Export stays enabled), and is overwritten by the next
   // successful connect. null = the name carried no parsable version.
   const [connectedFwVersion, setConnectedFwVersion] = useState<string | null>(null)
+  // The connected board's name as the BOARD reports it, read from its Device Name
+  // characteristic. Every "Connected to:" line renders this instead of
+  // device.name, which Chrome freezes when the grant is made and never refreshes,
+  // so on a board flashed since then it shows the version it USED to run. Kept in
+  // state rather than derived, because nothing about the BluetoothDevice object
+  // changes when the board is renamed - there would be nothing to re-render on.
+  //
+  // Tagged with the id it was read from, and only believed when that id still
+  // matches the connected device. Clearing it on disconnect instead would leave a
+  // window where connecting to a SECOND board whose name read fails displays the
+  // FIRST board's name - a wrong board is worse than a stale version.
+  const [connectedName, setConnectedName] = useState<{ id: string; name: string } | null>(null)
 
   const [serialPort, setSerialPort] = useState<SerialPort | null>(null)
   const [isSerialConnected, setIsSerialConnected] = useState(false)
@@ -107,9 +268,17 @@ export default function BluetoothDataLogger() {
   const [isRefConnecting, setIsRefConnecting] = useState(false)
   const [latestRefPower, setLatestRefPower] = useState<number>(0)
 
-  // Data management
-  const [allData, setAllData] = useState<DataPoint[]>([])
+  // Data management. The recording itself lives ONLY in dataBufferRef - keeping
+  // a state copy meant re-copying the whole (unbounded) recording on every
+  // 100 ms chart tick. The UI needs just the count; exportToCSV reads the ref.
+  const [recordedCount, setRecordedCount] = useState(0)
   const [chartData, setChartData] = useState<ChartDataPoint[]>([])
+  // Master switch for CSV capture. ON (the historical behaviour) keeps every
+  // received sample in memory for Export to CSV; OFF keeps the charts live but
+  // retains only the rolling chart window, so a long idle bench session cannot
+  // grow memory without bound. Turning it OFF mid-session keeps what was already
+  // recorded - it pauses capture, it does not discard a recording.
+  const [csvCaptureEnabled, setCsvCaptureEnabled] = useState(true)
   const [stats, setStats] = useState({
     totalSamples: 0,
     samplingRate: 0,
@@ -141,12 +310,83 @@ export default function BluetoothDataLogger() {
     referencePower: true,
   })
 
-  const toggleLine = (key: string) => {
+  // Stable identity (useCallback + functional update) - this is a prop of every
+  // memoized chart card, and a fresh function per render would defeat the memo.
+  const toggleLine = useCallback((key: string) => {
     setLineVisibility((prev) => ({ ...prev, [key]: !prev[key] }))
+  }, [])
+
+  // State drives the switch UI; the ref is what the streaming closure reads.
+  const setCsvCapture = (enabled: boolean) => {
+    csvCaptureEnabledRef.current = enabled
+    setCsvCaptureEnabled(enabled)
+    writeBenchPrefs({ csvCaptureEnabled: enabled })
   }
+
+  const setDeviceFilter = (enabled: boolean) => {
+    setUseDeviceFilter(enabled)
+    writeBenchPrefs({ useDeviceFilter: enabled })
+  }
+
+  // Restore the bench switches from the previous session. Done in an effect,
+  // not in the useState initializers, because those also run during the Next
+  // prerender where localStorage does not exist (same reasoning as the flash
+  // history's post-mount load).
+  useEffect(() => {
+    const prefs = readBenchPrefs()
+    if (typeof prefs.csvCaptureEnabled === "boolean") {
+      csvCaptureEnabledRef.current = prefs.csvCaptureEnabled
+      setCsvCaptureEnabled(prefs.csvCaptureEnabled)
+    }
+    if (typeof prefs.useDeviceFilter === "boolean") setUseDeviceFilter(prefs.useDeviceFilter)
+  }, [])
+
+  // Pull a connected board's LIVE name into the scan list by asking the BOARD,
+  // not Chrome. On this bench names change constantly (each flash bumps the
+  // " v<version>" suffix), and BluetoothDevice.name is frozen at grant time and
+  // never updated - reading it back is what used to revert a corrected row to the
+  // build the board used to run (see lib/device-list.ts). The Device Name
+  // characteristic read inside readGapDeviceName is the authoritative source.
+  //
+  // Returns the name so a caller that also needs the version can stamp it from
+  // the same read. Requires an OPEN link, so it is called right after a connect
+  // succeeds; a disconnect handler has nothing left to read over.
+  const syncNameFromGatt = async (target: BluetoothDevice | null | undefined) => {
+    const gapName = await readGapDeviceName(target)
+    if (!gapName || !target) return null
+    // applyDeviceName returns the same array when nothing changed, so React bails
+    // out instead of re-rendering.
+    setAvailableDevices((prev) => applyDeviceName(prev, target.id, gapName, "gap"))
+    setConnectedName({ id: target.id, name: gapName })
+    return gapName
+  }
+
+  // A completed flash renames the board, and the DFU card's post-reset reconnect is
+  // the first moment that new name can be read. Fold it into both places a name is
+  // shown, so the firmware-update tab stops naming the build it just replaced.
+  const handleFlashedDeviceName = (name: string) => {
+    const id = device?.id
+    if (!id) return
+    setConnectedName({ id, name })
+    setAvailableDevices((prev) => applyDeviceName(prev, id, name, "gap"))
+  }
+
+  // What the "Connected to:" lines show: the board's own name when it was read
+  // from the board now connected, otherwise Chrome's frozen one as a last resort.
+  const displayedDeviceName =
+    (connectedName && connectedName.id === device?.id ? connectedName.name : null) ||
+    device?.name ||
+    "Unknown Device"
 
   // Refs for efficient data handling
   const dataBufferRef = useRef<DataPoint[]>([])
+  // The charts' own rolling buffer, fed on every packet regardless of the CSV
+  // switch and trimmed to the chart window - dataBufferRef used to serve both
+  // roles, which is exactly what made "chart without recording" impossible.
+  const chartBufferRef = useRef<DataPoint[]>([])
+  // Mirror of csvCaptureEnabled for the notification handler, which is a closure
+  // created once at stream start and never sees later state values.
+  const csvCaptureEnabledRef = useRef<boolean>(true)
   const lastUpdateRef = useRef<number>(Date.now())
   const startTimeRef = useRef<number>(0)
   const sampleCountRef = useRef<number>(0)
@@ -154,7 +394,14 @@ export default function BluetoothDataLogger() {
   const lastPacketTimeRef = useRef<number>(Date.now())
 
   const serialValueRef = useRef<number>(0)
-  const serialReaderRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
+  // The reader yields decoded STRINGS (it sits behind a TextDecoderStream).
+  const serialReaderRef = useRef<ReadableStreamDefaultReader<string> | null>(null)
+  // Throttle state for the on-screen serial value: the ref above is always
+  // current (every packet logs it), but re-rendering the page per received
+  // line is pointless - the display updates at most ~5x/s, with a trailing
+  // flush so the last value of a burst still lands.
+  const serialFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastSerialFlushRef = useRef<number>(0)
 
   const refPowerValueRef = useRef<number>(0)
   const refCharacteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null)
@@ -162,6 +409,11 @@ export default function BluetoothDataLogger() {
   // Holds the active notification handler so it can be removed on stop (prevents duplicate listeners)
   const notificationHandlerRef = useRef<((event: Event) => void) | null>(null)
   const streamingCharacteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null)
+
+  // Battery characteristic + its listener, kept so a disconnect can detach the
+  // listener instead of leaving it behind on the dead characteristic object.
+  const batteryCharacteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null)
+  const batteryHandlerRef = useRef<((event: Event) => void) | null>(null)
 
   // CycloWatt specific UUIDs
   const CYCLOWATT_SERVICE_UUID = "5a1d0001-c7a1-4b2e-9e4f-1a2b3c4d5e6f"
@@ -224,6 +476,11 @@ export default function BluetoothDataLogger() {
   useEffect(() => {
     const bt = navigator.bluetooth as (Bluetooth & { getDevices?: () => Promise<BluetoothDevice[]> }) | undefined
     if (!bt?.getDevices) return
+    // One controller stops every advertisement watch this effect starts, and
+    // the listener list lets cleanup detach what was attached (React StrictMode
+    // mounts effects twice in dev - without this the listeners would stack).
+    const watchAbort = new AbortController()
+    const advertisementListeners: Array<[BluetoothDevice, (event: Event) => void]> = []
     void bt
       .getDevices()
       .then((granted) => {
@@ -242,162 +499,89 @@ export default function BluetoothDataLogger() {
             }))
           return [...prev, ...remembered]
         })
+
+        // Passive presence, where the engine offers watchAdvertisements (it is
+        // feature-detected: Chrome still gates it behind a flag). Each received
+        // advertisement is positive evidence the board is powered on and in
+        // range - the row upgrades from "(remembered)" to "(in range)" - and it
+        // carries the board's CURRENT advertised name, so a board renamed by a
+        // flash corrects its row without anyone connecting to it.
+        let watching = 0
+        for (const grantedDevice of granted) {
+          const watchable = grantedDevice as BluetoothDevice & {
+            watchAdvertisements?: (options?: { signal?: AbortSignal }) => Promise<void>
+          }
+          if (typeof watchable.watchAdvertisements !== "function") continue
+          watching += 1
+          const onAdvertisement = (event: Event) => {
+            // Structural read of BluetoothAdvertisingEvent.name - per-event data
+            // straight off the air, and the freshest name available pre-connect.
+            //
+            // Deliberately NOT falling back to grantedDevice.name: that is the
+            // name Chrome froze at grant time, so falling back to it would let a
+            // repeating advertisement re-assert a stale name over a corrected row.
+            // An advertisement carrying no name simply carries no name news, and
+            // applyDeviceName ignores an empty candidate while still latching
+            // inRange.
+            const advertisedName = (event as Event & { name?: string }).name
+            // The "advertisement" origin is what stops a data-acquisition board's
+            // truncated 11-char on-air name from displacing the fuller name a
+            // Device Name read already established. applyDeviceName also returns
+            // the same array when nothing changed, which matters here:
+            // advertisements repeat several times a second.
+            setAvailableDevices((prev) =>
+              applyDeviceName(prev, grantedDevice.id, advertisedName, "advertisement", {
+                inRange: true,
+              }),
+            )
+          }
+          grantedDevice.addEventListener("advertisementreceived", onAdvertisement)
+          advertisementListeners.push([grantedDevice, onAdvertisement])
+          watchable.watchAdvertisements({ signal: watchAbort.signal }).catch(() => {
+            // Unsupported despite the function existing, or the watch was
+            // aborted - either way the row simply stays "(remembered)".
+          })
+        }
+
+        // Whether a remembered row can correct its own name WITHOUT connecting
+        // comes down to this count, so say so once rather than leave an operator
+        // wondering why a reflashed board still shows its old version. Zero is the
+        // normal state in stable Chrome: watchAdvertisements() is still behind
+        // chrome://flags/#enable-experimental-web-platform-features. With it off, a
+        // remembered row shows the name Chrome cached at grant time until something
+        // opens a link (Scan, Connect, or DFU connect), which reads the name from
+        // the board itself.
+        if (watching > 0) {
+          console.log(`Passive name refresh active on ${watching}/${granted.length} remembered device(s).`)
+        } else if (granted.length > 0) {
+          console.log(
+            "Passive name refresh unavailable (watchAdvertisements is flag-gated) - " +
+              `${granted.length} remembered device(s) show their cached name until connected.`,
+          )
+        }
       })
       .catch(() => {}) // permission-API hiccups are non-fatal — the user can still Scan
-  }, [])
-
-  const chartConfig = {
-    force0: {
-      label: "Compression Ch 0",
-      color: "hsl(var(--chart-1))",
-    },
-    force2: {
-      label: "Compression Ch 2",
-      color: "hsl(var(--chart-2))",
-    },
-    force4: {
-      label: "Compression Ch 4",
-      color: "hsl(var(--chart-3))",
-    },
-    force1: {
-      label: "Shear Ch 1",
-      color: "hsl(var(--chart-1))",
-    },
-    force3: {
-      label: "Shear Ch 3",
-      color: "hsl(var(--chart-2))",
-    },
-    force5: {
-      label: "Shear Ch 5",
-      color: "hsl(var(--chart-3))",
-    },
-    // Units below follow the firmware's wire contract: it packs accel in milli-g
-    // and gyro in milli-rad/s, and parseDataPacket divides both by 1000. So these
-    // traces are g and rad/s - NOT the m/s2 and deg/s they were labelled as.
-    accelX: {
-      label: "Accel X (g)",
-      color: "hsl(var(--chart-2))",
-    },
-    accelY: {
-      label: "Accel Y (g)",
-      color: "hsl(var(--chart-3))",
-    },
-    accelZ: {
-      label: "Accel Z (g)",
-      color: "hsl(var(--chart-4))",
-    },
-    gyroX: {
-      label: "Gyro X (rad/s)",
-      color: "hsl(var(--chart-5))",
-    },
-    gyroY: {
-      label: "Gyro Y (rad/s)",
-      color: "hsl(220, 70%, 50%)",
-    },
-    gyroZ: {
-      label: "Gyro Z (rad/s)",
-      color: "hsl(280, 70%, 50%)",
-    },
-    // Slot 12 of the capture packet is a frozen zero-fill field, not a reading. The
-    // on-board estimator produces power per crank REVOLUTION, so there is no
-    // per-sample value to pack; power for a capture is computed from the channels
-    // offline. The trace is kept (the slot is still parsed and exported) but must
-    // not read as a measurement - it is a flat zero line by design.
-    power: {
-      label: "Board Power (unused - always 0)",
-      color: "hsl(45, 90%, 50%)",
-    },
-    referencePower: {
-      label: "Reference Power (W)",
-      color: "hsl(200, 80%, 45%)",
-    },
-    synchronization: {
-      label: "Sync",
-      color: "hsl(var(--chart-1))",
-    },
-  }
-
-  // Renders clickable legend chips that toggle each line's visibility
-  const renderLineToggles = (keys: string[]) => (
-    <div className="flex flex-wrap gap-2 px-2 pb-2">
-      {keys.map((key) => {
-        const config = chartConfig[key as keyof typeof chartConfig]
-        const visible = lineVisibility[key]
-        return (
-          <button
-            key={key}
-            type="button"
-            onClick={() => toggleLine(key)}
-            aria-pressed={visible}
-            className={`flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-medium transition-colors ${
-              visible
-                ? "border-gray-300 bg-gray-50 text-gray-900"
-                : "border-gray-200 bg-transparent text-gray-400"
-            }`}
-          >
-            <span
-              className="h-2.5 w-2.5 rounded-full"
-              style={{ backgroundColor: visible ? config.color : "transparent", border: `1px solid ${config.color}` }}
-            />
-            {config.label}
-          </button>
-        )
-      })}
-    </div>
-  )
-
-  // Y-axis range derived from only what is actually on screen: the currently visible
-  // channels, restricted to the brushed index window. Hiding a channel with a large
-  // range therefore rescales the axis around the ones that remain.
-  const getYDomain = (
-    keys: string[],
-    zoom: { startIndex?: number; endIndex?: number },
-  ): [number | "auto", number | "auto"] => {
-    const visibleKeys = keys.filter((key) => lineVisibility[key])
-    if (visibleKeys.length === 0 || chartData.length === 0) return ["auto", "auto"]
-
-    const start = Math.max(0, zoom.startIndex ?? 0)
-    const end = Math.min(chartData.length - 1, zoom.endIndex ?? chartData.length - 1)
-
-    let min = Number.POSITIVE_INFINITY
-    let max = Number.NEGATIVE_INFINITY
-
-    for (let i = start; i <= end; i++) {
-      const point = chartData[i]
-      if (!point) continue
-      for (const key of visibleKeys) {
-        const value = point[key as keyof ChartDataPoint]
-        if (typeof value !== "number" || !Number.isFinite(value)) continue
-        if (value < min) min = value
-        if (value > max) max = value
+    return () => {
+      watchAbort.abort()
+      for (const [watchedDevice, listener] of advertisementListeners) {
+        watchedDevice.removeEventListener("advertisementreceived", listener)
       }
     }
-
-    // No usable samples in this window yet — let recharts pick.
-    if (min === Number.POSITIVE_INFINITY) return ["auto", "auto"]
-
-    // Flat signal: give it headroom so the line isn't pinned to an axis edge.
-    if (min === max) {
-      const pad = Math.abs(min) * 0.1 || 1
-      return [min - pad, max + pad]
-    }
-
-    const pad = (max - min) * 0.05
-    return [min - pad, max + pad]
-  }
+  }, [])
 
   const updateCharts = () => {
     const now = Date.now()
-    const newData = [...dataBufferRef.current]
 
-    // Keep only last 500 points for chart performance
-    const chartPoints = newData.slice(-500).map((point) => ({
-      time: new Date(point.timestamp).toLocaleTimeString("en-US", {
-        hour12: false,
-        minute: "2-digit",
-        second: "2-digit",
-        fractionalSecondDigits: 1,
-      }),
+    // The charts only ever show the last 500 samples, so only that many are
+    // kept. Trimming here (10x/s) instead of on every packet keeps the
+    // notification hot path down to a push.
+    if (chartBufferRef.current.length > 500) {
+      chartBufferRef.current.splice(0, chartBufferRef.current.length - 500)
+    }
+
+    const chartPoints = chartBufferRef.current.map((point) => ({
+      // Formatted once at parse time - see DataPoint.timeLabel.
+      time: point.timeLabel,
       force0: point.force0,
       force1: point.force1,
       force2: point.force2,
@@ -416,7 +600,11 @@ export default function BluetoothDataLogger() {
     }))
 
     setChartData(chartPoints)
-    setAllData(newData)
+
+    // Publish only the COUNT - the recording itself stays in the ref, so this
+    // costs nothing however large the capture grows (React bails out of the
+    // set when the number is unchanged, e.g. while CSV capture is off).
+    setRecordedCount(dataBufferRef.current.length)
 
     // Update stats
     const duration = startTimeRef.current > 0 ? (now - startTimeRef.current) / 1000 : 0
@@ -440,7 +628,8 @@ export default function BluetoothDataLogger() {
       }
 
       console.log("\n🔌 CONNECTING TO SERIAL PORT...")
-      const port = await (navigator as any).serial.requestPort()
+      // Typed since @types/w3c-web-serial - the `as any` escape hatch is gone.
+      const port = await navigator.serial.requestPort()
       await port.open({ baudRate: 9600 })
 
       setSerialPort(port)
@@ -455,12 +644,31 @@ export default function BluetoothDataLogger() {
     }
   }
 
+  // Leading + trailing throttle: immediate when the display is stale, else one
+  // deferred flush so the final value of a burst is never lost.
+  const queueSerialDisplayUpdate = () => {
+    const now = Date.now()
+    if (now - lastSerialFlushRef.current >= 200) {
+      lastSerialFlushRef.current = now
+      setLatestSerialValue(serialValueRef.current)
+    } else if (serialFlushTimerRef.current === null) {
+      serialFlushTimerRef.current = setTimeout(() => {
+        serialFlushTimerRef.current = null
+        lastSerialFlushRef.current = Date.now()
+        setLatestSerialValue(serialValueRef.current)
+      }, 200)
+    }
+  }
+
   const startSerialReading = async (port: SerialPort) => {
     try {
       const textDecoder = new TextDecoderStream()
-      const readableStreamClosed = port.readable!.pipeTo(textDecoder.writable)
+      // The cast bridges two libs' stream generics: w3c-web-serial types the
+      // port as ReadableStream<Uint8Array> while lib.dom types the decoder's
+      // sink as WritableStream<BufferSource>; a Uint8Array IS a BufferSource.
+      const readableStreamClosed = port.readable!.pipeTo(textDecoder.writable as WritableStream<Uint8Array>)
       const reader = textDecoder.readable.getReader()
-      serialReaderRef.current = reader as any
+      serialReaderRef.current = reader
 
       console.log("📡 Starting serial data reading...")
 
@@ -479,8 +687,9 @@ export default function BluetoothDataLogger() {
 
           if (!isNaN(numValue)) {
             serialValueRef.current = numValue
-            setLatestSerialValue(numValue)
-            console.log(`📥 Serial data received: ${numValue}`)
+            queueSerialDisplayUpdate()
+            // Per-line log at serial line rate - debug only, like the packet log.
+            if (DEBUG_PACKET_LOG) console.log(`Serial data received: ${numValue}`)
           }
         }
       }
@@ -507,6 +716,12 @@ export default function BluetoothDataLogger() {
 
       setIsSerialConnected(false)
       serialValueRef.current = 0
+      // Cancel any deferred display flush so it cannot resurrect a stale value
+      // after the zeroing below.
+      if (serialFlushTimerRef.current !== null) {
+        clearTimeout(serialFlushTimerRef.current)
+        serialFlushTimerRef.current = null
+      }
       setLatestSerialValue(0)
       console.log("🔌 Serial port disconnected")
     } catch (err) {
@@ -517,7 +732,10 @@ export default function BluetoothDataLogger() {
   // Connect to a reference power meter via the standard Cycling Power Service
   const connectReferencePowerMeter = async () => {
     try {
-      if (!navigator.bluetooth) {
+      // Bound once and reused below, so the availability check covers both
+      // chooser calls (typed via @types/web-bluetooth).
+      const ble = navigator.bluetooth
+      if (!ble) {
         setError("Web Bluetooth API is not supported in this browser.")
         return
       }
@@ -527,14 +745,56 @@ export default function BluetoothDataLogger() {
       console.log("\n🚴 CONNECTING TO REFERENCE POWER METER (CPS)...")
       console.log("CPS Service UUID:", CPS_SERVICE_UUID)
 
-      const device = await navigator.bluetooth.requestDevice({
+      // This area is the SRM's alone. Our own boards advertise the standard Cycling
+      // Power service (0x1818) exactly as a commercial meter does (firmware
+      // src/ble/ble_adv.c), so filtering on that service alone lists every CycloWatt
+      // board in this chooser next to the real reference meter. Picking one made it
+      // the "reference" meter and printed a CycloWatt name inside this card - a
+      // measurement compared against itself, presented as an independent reference.
+      //
+      // Two layers, because neither suffices alone. exclusionFilters keeps our boards
+      // out of the chooser, which is the half the user actually sees, but it is
+      // Chrome 114+ and older engines reject the whole call. The post-pick check
+      // below is the half that GUARANTEES it: Web Bluetooth filters are OR-ed and
+      // cannot express "this service but not that name".
+      const refRequestOptions: RequestDeviceOptions = {
         filters: [{ services: [CPS_SERVICE_UUID] }],
         optionalServices: [CPS_SERVICE_UUID],
-      })
+      }
 
-      console.log(`📱 Selected reference device: ${device.name || "Unknown"} (${device.id})`)
+      // .catch rather than try/catch keeps this a single const binding for the
+      // whole flow below, whichever chooser call produced it.
+      const refCandidate = await ble
+        .requestDevice({
+          ...refRequestOptions,
+          exclusionFilters: BOARD_NAME_PREFIXES.map((namePrefix) => ({ namePrefix })),
+        } as RequestDeviceOptions)
+        .catch((err: unknown) => {
+          // A cancelled chooser is a DOMException (NotFoundError) and has to keep
+          // propagating to the outer catch. Only an engine that does not understand
+          // exclusionFilters throws TypeError, and it gets a second, plain chooser
+          // rather than a button that appears broken.
+          if (!(err instanceof TypeError)) throw err
+          console.warn("exclusionFilters unsupported here; relying on the post-pick check")
+          return ble.requestDevice(refRequestOptions)
+        })
 
-      const server = await device.gatt!.connect()
+      console.log(`📱 Selected reference device: ${refCandidate.name || "Unknown"} (${refCandidate.id})`)
+
+      // Reject before connecting, so no ref* state is ever touched by one of ours.
+      // The id comparison catches the same physical board arriving under a name the
+      // prefix list does not know, e.g. a peer that renamed it over GATT.
+      if (isBoardName(refCandidate.name) || (refCandidate.id && refCandidate.id === device?.id)) {
+        setError(
+          `${refCandidate.name || "That device"} is a CycloWatt board, not a reference meter. ` +
+            "This panel is for the SRM (or another independent power meter) only - connect a " +
+            "CycloWatt board with the sensor connection above instead.",
+        )
+        console.warn("Rejected a CycloWatt board picked as the reference meter")
+        return
+      }
+
+      const server = await refCandidate.gatt!.connect()
       console.log("✅ Connected to reference GATT server")
 
       const cpsService = await server.getPrimaryService(CPS_SERVICE_UUID)
@@ -548,10 +808,10 @@ export default function BluetoothDataLogger() {
       console.log("📡 Reference power notifications started")
 
       refCharacteristicRef.current = measurementChar
-      setRefDevice(device)
+      setRefDevice(refCandidate)
       setIsRefConnected(true)
 
-      device.addEventListener("gattserverdisconnected", handleReferenceDisconnection)
+      refCandidate.addEventListener("gattserverdisconnected", handleReferenceDisconnection)
     } catch (err) {
       console.error("Reference power meter connection failed:", err)
       setError(`Reference power meter connection failed: ${err instanceof Error ? err.message : "Unknown error"}`)
@@ -655,9 +915,18 @@ export default function BluetoothDataLogger() {
 
       // Check if this device has our target service
       let hasTargetService = false
+      // The board's own name, read over the probe link below. device.name is the
+      // name Chrome cached when the grant was made and never refreshes, so on a
+      // board flashed since then it is the OLD name - and this scan path REPLACES
+      // the whole row, which is how picking a board through the chooser used to
+      // undo a name an advertisement had already corrected.
+      let gapName: string | null = null
       try {
         if (device.gatt) {
           const server = await device.gatt.connect()
+          // Read the name FIRST: this is the only moment in the scan with an open
+          // link, and the name is wanted even if service probing below throws.
+          gapName = await readGapDeviceName(device)
           console.log("✅ Connected to GATT server for scanning")
 
           try {
@@ -704,7 +973,7 @@ export default function BluetoothDataLogger() {
       // Add to available devices list
       const newDevice: AvailableDevice = {
         device,
-        name: device.name || "Unknown Device",
+        name: gapName || device.name || "Unknown Device",
         id: device.id,
         hasTargetService,
         // Picked through the chooser in this session — the row shows live scan
@@ -716,7 +985,14 @@ export default function BluetoothDataLogger() {
       setAvailableDevices((prev) => {
         const existing = prev.find((d) => d.id === device.id)
         if (existing) {
-          return prev.map((d) => (d.id === device.id ? newDevice : d))
+          // Every other field on the rebuilt row is fresher than the old one, but
+          // the NAME may not be: if the GAP read failed, newDevice.name fell back
+          // to Chrome's frozen cache, which must not displace a name an
+          // advertisement already corrected. Origin "gap" only when the read
+          // actually succeeded, since only an authoritative read earns the right
+          // to shorten the name already on the row.
+          const name = nextDisplayName(existing.name, newDevice.name, gapName ? "gap" : "advertisement")
+          return prev.map((d) => (d.id === device.id ? { ...newDevice, name } : d))
         }
         return [...prev, newDevice]
       })
@@ -789,11 +1065,17 @@ export default function BluetoothDataLogger() {
       setCharacteristic(dataCharacteristic)
       setIsConnected(true)
       setConnectionMode("normal")
-      // Latch the build for the CSV filename now, while the name is in hand.
-      setConnectedFwVersion(firmwareVersionFromName(device.name))
       sessionOwned = true
 
       device.addEventListener("gattserverdisconnected", handleDisconnection)
+
+      // Ask the board for its current GAP name now that a link exists, and both
+      // correct its row and stamp the CSV filename's build from that one read.
+      // device.name is only the fallback: it is whatever Chrome cached when the
+      // grant was made, so on a board flashed since then it names the OLD build.
+      const gapName = await syncNameFromGatt(device)
+      // Latch the build for the CSV filename while the name is in hand.
+      setConnectedFwVersion(firmwareVersionFromName(gapName ?? device.name))
 
       console.log("🎉 CONNECTION SUCCESSFUL!")
       console.log("🚀 Ready to start data streaming...")
@@ -809,10 +1091,14 @@ export default function BluetoothDataLogger() {
         const batteryChar = await batteryService.getCharacteristic("battery_level")
         const initial = await batteryChar.readValue()
         setBatteryLevel(initial.getUint8(0))
-        batteryChar.addEventListener("characteristicvaluechanged", (event) => {
+        const batteryHandler = (event: Event) => {
           const value = (event.target as BluetoothRemoteGATTCharacteristic).value
           if (value) setBatteryLevel(value.getUint8(0))
-        })
+        }
+        batteryChar.addEventListener("characteristicvaluechanged", batteryHandler)
+        // Remembered so handleDisconnection can detach the listener.
+        batteryCharacteristicRef.current = batteryChar
+        batteryHandlerRef.current = batteryHandler
         await batteryChar.startNotifications()
         console.log("🔋 Battery Service subscribed")
       } catch (batteryErr) {
@@ -867,12 +1153,28 @@ export default function BluetoothDataLogger() {
     setDevice(null)
     setService(null)
     setCharacteristic(null)
+    // Detach the battery listener with the session it belongs to - reconnecting
+    // subscribes afresh, and a leftover listener would double-fire then.
+    if (batteryCharacteristicRef.current && batteryHandlerRef.current) {
+      batteryCharacteristicRef.current.removeEventListener(
+        "characteristicvaluechanged",
+        batteryHandlerRef.current,
+      )
+    }
+    batteryCharacteristicRef.current = null
+    batteryHandlerRef.current = null
     setBatteryLevel(null)
     // Any disconnect ends the session's mode. Without this, a DFU-only session
     // would leave the logging UI hidden until a successful raw-stream connect —
     // which a freshly-flashed prod image (no raw-stream service) can never provide.
     // The DFU card is unaffected: it stays mounted and keeps its own device ref.
     setConnectionMode("normal")
+    // Deliberately NOT refreshing the name here. A session can end with the board
+    // carrying a different name than it started with (a DFU rename), but the only
+    // trustworthy source is a Device Name read over an open link, and by now the
+    // link is gone. Chrome's cached BluetoothDevice.name is no substitute - reading
+    // it here is precisely what used to overwrite a corrected row with a stale
+    // name. The row self-corrects on the next advertisement or the next connect.
   }
 
   const disconnect = async () => {
@@ -913,6 +1215,10 @@ export default function BluetoothDataLogger() {
       setIsConnected(true)
       setConnectionMode("dfu")
       dfuDevice.addEventListener("gattserverdisconnected", handleDisconnection)
+      // Same reason as the normal connect path - and this one matters most: a
+      // DFU-only session is usually opened to flash the board, so its name is
+      // about to change, and the row should start from the truth.
+      await syncNameFromGatt(dfuDevice)
     } catch (err) {
       console.error("DFU-only connection failed:", err)
       setError(`DFU connect failed: ${err instanceof Error ? err.message : "Unknown error"}`)
@@ -956,8 +1262,16 @@ export default function BluetoothDataLogger() {
       const ticksHigh = dataView.getUint32(60, true) // index 15 — upper 32 bits
       const ticksMcu = Number((BigInt(ticksHigh) << 32n) | BigInt(ticksLow))
 
+      const timestamp = Date.now()
+      const labelDate = new Date(timestamp)
       const dataPoint: DataPoint = {
-        timestamp: Date.now(),
+        timestamp,
+        // Same "MM:SS.tenth" the chart axis always showed, hand-rolled: the
+        // toLocaleTimeString call it replaces goes through Intl, far too heavy
+        // for a per-packet path (and worse, it used to run per chart REDRAW).
+        timeLabel: `${String(labelDate.getMinutes()).padStart(2, "0")}:${String(
+          labelDate.getSeconds(),
+        ).padStart(2, "0")}.${Math.floor(labelDate.getMilliseconds() / 100)}`,
         tick,
         ticksMcu,
         force0,
@@ -977,14 +1291,16 @@ export default function BluetoothDataLogger() {
         synchronization: serialValueRef.current,
       }
 
-      const timestamp = new Date().toISOString()
-      console.log(`📦 [${timestamp}] Packet #${packetCountRef.current + 1} tick=${tick} ticksMcu=${ticksMcu}`)
-      console.log(
-        `📊 [${timestamp}] Force=[${force0}, ${force1}, ${force2}, ${force3}, ${force4}, ${force5}] PowerSlot=${power}`,
-      )
-      console.log(
-        `🔄 [${timestamp}] Accel=[${accelX}, ${accelY}, ${accelZ}] Gyro=[${gyroX}, ${gyroY}, ${gyroZ}] Sync=${serialValueRef.current}`,
-      )
+      if (DEBUG_PACKET_LOG) {
+        const iso = labelDate.toISOString()
+        console.log(`[${iso}] Packet #${packetCountRef.current + 1} tick=${tick} ticksMcu=${ticksMcu}`)
+        console.log(
+          `[${iso}] Force=[${force0}, ${force1}, ${force2}, ${force3}, ${force4}, ${force5}] PowerSlot=${power}`,
+        )
+        console.log(
+          `[${iso}] Accel=[${accelX}, ${accelY}, ${accelZ}] Gyro=[${gyroX}, ${gyroY}, ${gyroZ}] Sync=${serialValueRef.current}`,
+        )
+      }
 
       return dataPoint
     } catch (error) {
@@ -1020,12 +1336,20 @@ export default function BluetoothDataLogger() {
 
           const dataPoint = parseDataPacket(dataView)
           if (dataPoint) {
-            dataBufferRef.current.push(dataPoint)
+            // Charts always get the sample; the export buffer only while the
+            // CSV switch is on (read via the ref - this closure is created once
+            // at stream start and never sees later state values).
+            chartBufferRef.current.push(dataPoint)
+            if (csvCaptureEnabledRef.current) {
+              dataBufferRef.current.push(dataPoint)
+            }
             sampleCountRef.current++
 
-            // Update charts periodically
-            if (now - lastUpdateRef.current > 100) {
-              // Update every 100ms
+            // Update charts periodically (every 100 ms) - but not while the tab
+            // is hidden: rendering five charts nobody can see is pure waste.
+            // Buffers keep filling regardless, and the first tick after the tab
+            // becomes visible again catches the display up.
+            if (document.visibilityState === "visible" && now - lastUpdateRef.current > 100) {
               updateCharts()
             }
           }
@@ -1054,6 +1378,8 @@ export default function BluetoothDataLogger() {
       sampleCountRef.current = 0
       packetCountRef.current = 0
       dataBufferRef.current = []
+      chartBufferRef.current = []
+      setRecordedCount(0)
 
       console.log("📡 Listening for 16x int32 data packets (64 bytes)...")
     } catch (err) {
@@ -1084,7 +1410,9 @@ export default function BluetoothDataLogger() {
   }
 
   const exportToCSV = () => {
-    if (allData.length === 0) return
+    // The recording lives in the ref, not in state - see recordedCount.
+    const recorded = dataBufferRef.current
+    if (recorded.length === 0) return
 
     const headers = [
       "tick",
@@ -1107,7 +1435,7 @@ export default function BluetoothDataLogger() {
     ]
     const csvContent = [
       headers.join(","),
-      ...allData.map((point) =>
+      ...recorded.map((point) =>
         [
           point.tick,
           point.ticksMcu,
@@ -1139,7 +1467,7 @@ export default function BluetoothDataLogger() {
     const timestampPart = new Date().toISOString().split("T")[0]
     // Read the LATCH, not `device?.name`: the usual bench order is record →
     // disconnect → export, and by export time handleDisconnection has already
-    // nulled `device` while allData survives and Export stays enabled — parsing
+    // nulled `device` while the recording survives and Export stays enabled — parsing
     // the live name here dropped the _fw tag exactly when it mattered most. The
     // live name is only a fallback for a session that predates the latch.
     const fwVersion = connectedFwVersion ?? firmwareVersionFromName(device?.name)
@@ -1151,11 +1479,6 @@ export default function BluetoothDataLogger() {
     URL.revokeObjectURL(url)
   }
 
-  const resetCompressionZoom = () => setCompressionZoom({})
-  const resetShearZoom = () => setShearZoom({})
-  const resetAccelZoom = () => setAccelZoom({})
-  const resetGyroZoom = () => setGyroZoom({})
-  const resetPowerZoom = () => setPowerZoom({})
   const resetAllZoom = () => {
     setCompressionZoom({})
     setShearZoom({})
@@ -1342,7 +1665,7 @@ export default function BluetoothDataLogger() {
                   <Switch
                     id="device-filter"
                     checked={useDeviceFilter}
-                    onCheckedChange={setUseDeviceFilter}
+                    onCheckedChange={setDeviceFilter}
                     disabled={isConnected}
                   />
                   <Label htmlFor="device-filter" className="cursor-pointer">
@@ -1351,6 +1674,20 @@ export default function BluetoothDataLogger() {
                       {useDeviceFilter
                         ? `Only devices named ${BOARD_NAME_PREFIX_HINT} will appear`
                         : "All Bluetooth devices will appear in the scan"}
+                    </div>
+                  </Label>
+                </div>
+
+                <div className="flex items-center space-x-2 p-3 bg-gray-50 border border-gray-200 rounded-lg">
+                  {/* Deliberately NOT disabled while connected/streaming: pausing
+                      capture mid-session (e.g. between test runs) is the point. */}
+                  <Switch id="csv-capture" checked={csvCaptureEnabled} onCheckedChange={setCsvCapture} />
+                  <Label htmlFor="csv-capture" className="cursor-pointer">
+                    <div className="font-medium">Record samples for CSV export</div>
+                    <div className="text-xs text-gray-500">
+                      {csvCaptureEnabled
+                        ? "Every received sample is kept in memory and included in Export to CSV"
+                        : "Charts stay live, but new samples are not recorded - already-recorded samples are kept"}
                     </div>
                   </Label>
                 </div>
@@ -1380,9 +1717,9 @@ export default function BluetoothDataLogger() {
                         Stop Streaming
                       </Button>
                     )}
-                    <Button onClick={exportToCSV} disabled={allData.length === 0} className="flex items-center gap-2">
+                    <Button onClick={exportToCSV} disabled={recordedCount === 0} className="flex items-center gap-2">
                       <Download className="w-4 h-4" />
-                      Export to CSV ({allData.length.toLocaleString()} samples)
+                      Export to CSV ({recordedCount.toLocaleString()} samples)
                     </Button>
                   </div>
                 )}
@@ -1397,11 +1734,15 @@ export default function BluetoothDataLogger() {
                             <div className="flex flex-col">
                               <span className="font-medium">
                                 {availableDevice.name}{" "}
-                                {/* Flags a permission record from a past session, not a live
-                                    scan hit — the board may well be asleep or busy. */}
-                                {availableDevice.remembered && (
+                                {/* "(in range)" = an advertisement was actually seen this
+                                    session (positive evidence, needs watchAdvertisements
+                                    support); "(remembered)" = only a permission record from
+                                    a past session - the board may well be asleep or busy. */}
+                                {availableDevice.inRange ? (
+                                  <span className="text-xs text-green-600">(in range)</span>
+                                ) : availableDevice.remembered ? (
                                   <span className="text-xs text-muted-foreground">(remembered)</span>
-                                )}
+                                ) : null}
                               </span>
                               <span className="text-xs text-gray-500">{availableDevice.id}</span>
                             </div>
@@ -1427,7 +1768,9 @@ export default function BluetoothDataLogger() {
 
                 {isConnected && (
                   <div className="text-sm text-gray-600 p-3 bg-green-50 border border-green-200 rounded-lg">
-                    <div className="font-medium">Connected to: {device?.name || "Unknown Device"}</div>
+                    <div className="font-medium">
+                      Connected to: {displayedDeviceName}
+                    </div>
                     {batteryLevel !== null && <div>Battery: {batteryLevel}%</div>}
                     <div>Service: {CYCLOWATT_SERVICE_UUID}</div>
                     <div>Characteristic: {CYCLOWATT_DATA_CHAR_UUID}</div>
@@ -1467,418 +1810,61 @@ export default function BluetoothDataLogger() {
               </div>
             )}
 
-            {/* Charts */}
+            {/* Charts - one memoized card each (see sensor-chart-card.tsx): they
+                re-render on chart ticks, visibility toggles and brush moves, and
+                skip the page's other re-renders (serial lines, battery, ref power). */}
             {connectionMode === "normal" && (
               <div className="grid grid-cols-1 gap-6">
-                {/* Compression Force Chart */}
-                <Card className="bg-white border-gray-200">
-                  <CardHeader className="flex flex-row items-center justify-between">
-                    <CardTitle>Compression Force (Channels 0, 2, 4)</CardTitle>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={resetCompressionZoom}
-                      disabled={!compressionZoom.startIndex && !compressionZoom.endIndex}
-                    >
-                      Reset Zoom
-                    </Button>
-                  </CardHeader>
-                  <CardContent className="p-2">
-                    {renderLineToggles(["force0", "force2", "force4"])}
-                    <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                          <XAxis
-                            dataKey="time"
-                            tick={false}
-                            axisLine={false}
-                            domain={["dataMin", "dataMax"]}
-                            type="category"
-                          />
-                          <YAxis
-                            tick={{ fontSize: 10 }}
-                            width={60}
-                            domain={getYDomain(["force0", "force2", "force4"], compressionZoom)}
-                            allowDataOverflow
-                          />
-                          <ChartTooltip content={<ChartTooltipContent />} />
-                          <Line
-                            type="monotone"
-                            dataKey="force0"
-                            stroke="var(--color-force0)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Channel 0"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.force0}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="force2"
-                            stroke="var(--color-force2)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Channel 2"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.force2}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="force4"
-                            stroke="var(--color-force4)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Channel 4"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.force4}
-                          />
-                          <Brush
-                            dataKey="time"
-                            height={30}
-                            stroke="var(--color-force0)"
-                            startIndex={compressionZoom.startIndex}
-                            endIndex={compressionZoom.endIndex}
-                            onChange={(brushData) => {
-                              if (brushData) {
-                                setCompressionZoom({
-                                  startIndex: brushData.startIndex,
-                                  endIndex: brushData.endIndex,
-                                })
-                              }
-                            }}
-                          />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    </ChartContainer>
-                  </CardContent>
-                </Card>
-
-                {/* Shear Force Chart */}
-                <Card className="bg-white border-gray-200">
-                  <CardHeader className="flex flex-row items-center justify-between">
-                    <CardTitle>Shear Force (Channels 1, 3, 5)</CardTitle>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={resetShearZoom}
-                      disabled={!shearZoom.startIndex && !shearZoom.endIndex}
-                    >
-                      Reset Zoom
-                    </Button>
-                  </CardHeader>
-                  <CardContent className="p-2">
-                    {renderLineToggles(["force1", "force3", "force5"])}
-                    <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                          <XAxis
-                            dataKey="time"
-                            tick={false}
-                            axisLine={false}
-                            domain={["dataMin", "dataMax"]}
-                            type="category"
-                          />
-                          <YAxis
-                            tick={{ fontSize: 10 }}
-                            width={60}
-                            domain={getYDomain(["force1", "force3", "force5"], shearZoom)}
-                            allowDataOverflow
-                          />
-                          <ChartTooltip content={<ChartTooltipContent />} />
-                          <Line
-                            type="monotone"
-                            dataKey="force1"
-                            stroke="var(--color-force1)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Channel 1"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.force1}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="force3"
-                            stroke="var(--color-force3)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Channel 3"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.force3}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="force5"
-                            stroke="var(--color-force5)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Channel 5"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.force5}
-                          />
-                          <Brush
-                            dataKey="time"
-                            height={30}
-                            stroke="var(--color-force1)"
-                            startIndex={shearZoom.startIndex}
-                            endIndex={shearZoom.endIndex}
-                            onChange={(brushData) => {
-                              if (brushData) {
-                                setShearZoom({
-                                  startIndex: brushData.startIndex,
-                                  endIndex: brushData.endIndex,
-                                })
-                              }
-                            }}
-                          />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    </ChartContainer>
-                  </CardContent>
-                </Card>
-
-                {/* Acceleration Chart */}
-                <Card className="bg-white border-gray-200">
-                  <CardHeader className="flex flex-row items-center justify-between">
-                    <CardTitle>Acceleration Data (g)</CardTitle>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={resetAccelZoom}
-                      disabled={!accelZoom.startIndex && !accelZoom.endIndex}
-                    >
-                      Reset Zoom
-                    </Button>
-                  </CardHeader>
-                  <CardContent className="p-2">
-                    {renderLineToggles(["accelX", "accelY", "accelZ"])}
-                    <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                          <XAxis
-                            dataKey="time"
-                            tick={false}
-                            axisLine={false}
-                            domain={["dataMin", "dataMax"]}
-                            type="category"
-                          />
-                          <YAxis
-                            tick={{ fontSize: 10 }}
-                            width={60}
-                            domain={getYDomain(["accelX", "accelY", "accelZ"], accelZoom)}
-                            allowDataOverflow
-                          />
-                          <ChartTooltip content={<ChartTooltipContent />} />
-                          <Line
-                            type="monotone"
-                            dataKey="accelX"
-                            stroke="var(--color-accelX)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Accel X"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.accelX}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="accelY"
-                            stroke="var(--color-accelY)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Accel Y"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.accelY}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="accelZ"
-                            stroke="var(--color-accelZ)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Accel Z"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.accelZ}
-                          />
-                          <Brush
-                            dataKey="time"
-                            height={30}
-                            stroke="var(--color-accelX)"
-                            startIndex={accelZoom.startIndex}
-                            endIndex={accelZoom.endIndex}
-                            onChange={(brushData) => {
-                              if (brushData) {
-                                setAccelZoom({
-                                  startIndex: brushData.startIndex,
-                                  endIndex: brushData.endIndex,
-                                })
-                              }
-                            }}
-                          />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    </ChartContainer>
-                  </CardContent>
-                </Card>
-
-                {/* Gyroscope Chart */}
-                <Card className="bg-white border-gray-200">
-                  <CardHeader className="flex flex-row items-center justify-between">
-                    <CardTitle>Gyroscope Data (rad/s)</CardTitle>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={resetGyroZoom}
-                      disabled={!gyroZoom.startIndex && !gyroZoom.endIndex}
-                    >
-                      Reset Zoom
-                    </Button>
-                  </CardHeader>
-                  <CardContent className="p-2">
-                    {renderLineToggles(["gyroX", "gyroY", "gyroZ"])}
-                    <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                          <XAxis
-                            dataKey="time"
-                            tick={false}
-                            axisLine={false}
-                            domain={["dataMin", "dataMax"]}
-                            type="category"
-                          />
-                          <YAxis
-                            tick={{ fontSize: 10 }}
-                            width={60}
-                            domain={getYDomain(["gyroX", "gyroY", "gyroZ"], gyroZoom)}
-                            allowDataOverflow
-                          />
-                          <ChartTooltip content={<ChartTooltipContent />} />
-                          <Line
-                            type="monotone"
-                            dataKey="gyroX"
-                            stroke="var(--color-gyroX)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Gyro X"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.gyroX}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="gyroY"
-                            stroke="var(--color-gyroY)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Gyro Y"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.gyroY}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="gyroZ"
-                            stroke="var(--color-gyroZ)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Gyro Z"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.gyroZ}
-                          />
-                          <Brush
-                            dataKey="time"
-                            height={30}
-                            stroke="var(--color-gyroX)"
-                            startIndex={gyroZoom.startIndex}
-                            endIndex={gyroZoom.endIndex}
-                            onChange={(brushData) => {
-                              if (brushData) {
-                                setGyroZoom({
-                                  startIndex: brushData.startIndex,
-                                  endIndex: brushData.endIndex,
-                                })
-                              }
-                            }}
-                          />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    </ChartContainer>
-                  </CardContent>
-                </Card>
-
-                {/* Power Chart */}
-                <Card className="bg-white border-gray-200">
-                  <CardHeader className="flex flex-row items-center justify-between">
-                    <CardTitle>Power Data (W) — Reference meter (board power unused)</CardTitle>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={resetPowerZoom}
-                      disabled={!powerZoom.startIndex && !powerZoom.endIndex}
-                    >
-                      Reset Zoom
-                    </Button>
-                  </CardHeader>
-                  <CardContent className="p-2">
-                    {renderLineToggles(["power", "referencePower"])}
-                    <ChartContainer config={chartConfig} className="h-[400px] w-full">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={chartData} margin={{ top: 10, right: 10, left: 10, bottom: 50 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                          <XAxis
-                            dataKey="time"
-                            tick={false}
-                            axisLine={false}
-                            domain={["dataMin", "dataMax"]}
-                            type="category"
-                          />
-                          <YAxis
-                            tick={{ fontSize: 10 }}
-                            width={60}
-                            domain={getYDomain(["power", "referencePower"], powerZoom)}
-                            allowDataOverflow
-                          />
-                          <ChartTooltip content={<ChartTooltipContent />} />
-                          <Line
-                            type="monotone"
-                            dataKey="power"
-                            stroke="var(--color-power)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="CycloWatt Power"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.power}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="referencePower"
-                            stroke="var(--color-referencePower)"
-                            strokeWidth={2}
-                            dot={false}
-                            name="Reference Power"
-                            isAnimationActive={false}
-                            hide={!lineVisibility.referencePower}
-                          />
-                          <Brush
-                            dataKey="time"
-                            height={30}
-                            stroke="var(--color-power)"
-                            startIndex={powerZoom.startIndex}
-                            endIndex={powerZoom.endIndex}
-                            onChange={(brushData) => {
-                              if (brushData) {
-                                setPowerZoom({
-                                  startIndex: brushData.startIndex,
-                                  endIndex: brushData.endIndex,
-                                })
-                              }
-                            }}
-                          />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    </ChartContainer>
-                  </CardContent>
-                </Card>
+                <SensorChartCard
+                  title="Compression Force (Channels 0, 2, 4)"
+                  lines={COMPRESSION_LINES}
+                  data={chartData}
+                  config={CHART_CONFIG}
+                  visibility={lineVisibility}
+                  zoom={compressionZoom}
+                  onZoomChange={setCompressionZoom}
+                  onToggleLine={toggleLine}
+                />
+                <SensorChartCard
+                  title="Shear Force (Channels 1, 3, 5)"
+                  lines={SHEAR_LINES}
+                  data={chartData}
+                  config={CHART_CONFIG}
+                  visibility={lineVisibility}
+                  zoom={shearZoom}
+                  onZoomChange={setShearZoom}
+                  onToggleLine={toggleLine}
+                />
+                <SensorChartCard
+                  title="Acceleration Data (g)"
+                  lines={ACCEL_LINES}
+                  data={chartData}
+                  config={CHART_CONFIG}
+                  visibility={lineVisibility}
+                  zoom={accelZoom}
+                  onZoomChange={setAccelZoom}
+                  onToggleLine={toggleLine}
+                />
+                <SensorChartCard
+                  title="Gyroscope Data (rad/s)"
+                  lines={GYRO_LINES}
+                  data={chartData}
+                  config={CHART_CONFIG}
+                  visibility={lineVisibility}
+                  zoom={gyroZoom}
+                  onZoomChange={setGyroZoom}
+                  onToggleLine={toggleLine}
+                />
+                <SensorChartCard
+                  title="Power Data (W) - Reference meter (board power unused)"
+                  lines={POWER_LINES}
+                  data={chartData}
+                  config={CHART_CONFIG}
+                  visibility={lineVisibility}
+                  zoom={powerZoom}
+                  onZoomChange={setPowerZoom}
+                  onToggleLine={toggleLine}
+                />
               </div>
             )}
 
@@ -1892,13 +1878,9 @@ export default function BluetoothDataLogger() {
                   <Button
                     variant="outline"
                     onClick={resetAllZoom}
-                    disabled={
-                      !compressionZoom.startIndex &&
-                      !shearZoom.startIndex &&
-                      !accelZoom.startIndex &&
-                      !gyroZoom.startIndex &&
-                      !powerZoom.startIndex
-                    }
+                    /* isZoomed, not startIndex truthiness: a brush that starts on
+                       the very first sample (index 0) is still a zoom. */
+                    disabled={![compressionZoom, shearZoom, accelZoom, gyroZoom, powerZoom].some(isZoomed)}
                   >
                     Reset All Zoom
                   </Button>
@@ -1937,7 +1919,7 @@ export default function BluetoothDataLogger() {
                 {isConnected && (
                   <div className="text-sm text-gray-600 p-3 bg-green-50 border border-green-200 rounded-lg">
                     <div className="font-medium">
-                      Connected to: {device?.name || "Unknown Device"}{" "}
+                      Connected to: {displayedDeviceName}{" "}
                       {connectionMode === "dfu" ? "(firmware-update-only)" : "(streaming connection)"}
                     </div>
                     {batteryLevel !== null && <div>Battery: {batteryLevel}%</div>}
@@ -1949,7 +1931,13 @@ export default function BluetoothDataLogger() {
             {/* Kept permanently mounted (forceMount on this panel) so an in-flight flow
                 (upload, resume, post-reset reconnect) survives tab switches and the
                 page's isConnected flapping. */}
-            <DfuCard device={device} isStreaming={isStreaming} stopStreaming={stopDataStreaming} />
+            <DfuCard
+              device={device}
+              isStreaming={isStreaming}
+              stopStreaming={stopDataStreaming}
+              deviceName={connectedName?.id === device?.id ? connectedName?.name : null}
+              onDeviceName={handleFlashedDeviceName}
+            />
           </TabsContent>
         </Tabs>
       </div>

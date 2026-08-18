@@ -5,10 +5,17 @@
  * slot hashes, confirmed/pending flags) and offers a remote reboot — the same
  * OS-group reset the DFU flow already uses. Opens a short-lived SMP client per
  * action so it never holds the characteristic while a flash flow runs.
+ *
+ * It also answers "is an update running?" on the line above the buttons, via
+ * describeDfuActivity - which combines the in-flight flag this panel already
+ * receives with the image flags it already reads. Under safe boot an update is
+ * still underway after the upload ends (staged for the next boot, or running its
+ * unconfirmed trial), and neither state was visible here before.
  */
 
 import { useState } from "react"
 import { Button } from "@/components/ui/button"
+import { describeDfuActivity } from "@/lib/dfu-status"
 import { openSmpClient } from "@/lib/smp/gatt"
 import type { ImageSlotState } from "@/lib/smp/client"
 
@@ -69,6 +76,10 @@ export function DevicePanel({ device, busy }: DevicePanelProps) {
   }
 
   const disabled = !device || busy
+  // Whether an update is underway, from the in-flight flag this panel already
+  // receives plus the image flags it already reads. `busy` was previously used
+  // only to grey the buttons out, never to say why.
+  const activity = describeDfuActivity(slots, busy)
   return (
     <div className="space-y-2">
       <div className="flex gap-2">
@@ -79,15 +90,30 @@ export function DevicePanel({ device, busy }: DevicePanelProps) {
           Reboot device
         </Button>
       </div>
+      {activity.text && (
+        // An update in progress is a warning-coloured statement of fact, not an
+        // error: a staged or on-trial image is a normal, temporary bench state,
+        // but one a reader must not mistake for a settled board.
+        <div className={activity.running ? "text-sm font-medium text-amber-700" : "text-sm text-muted-foreground"}>
+          {activity.text}
+        </div>
+      )}
       {slots.map((slot, index) => (
         // A device with several images can report the same slot number twice
         // (one pair per image), so the slot number alone is not a unique key.
         <div key={`${slot.slot}-${index}`} className="text-sm">
           slot {slot.slot}: v{slot.version}
-          {slot.active ? " · running" : ""}
-          {slot.confirmed ? " · confirmed" : ""}
-          {slot.pending ? " · pending" : ""}
-          <span className="text-muted-foreground"> · {toHex(slot.hash).slice(0, 12)}…</span>
+          {slot.active ? " - running" : ""}
+          {slot.confirmed ? " - confirmed" : ""}
+          {slot.pending ? " - pending" : ""}
+          {/*
+            Both of these were parsed and then dropped on the floor. "not bootable"
+            is the interesting direction - a slot holding an image MCUboot has
+            rejected looks identical to an empty one without it.
+          */}
+          {slot.bootable ? "" : " - not bootable"}
+          {slot.permanent ? " - permanent" : ""}
+          <span className="text-muted-foreground"> - {toHex(slot.hash).slice(0, 12)}...</span>
         </div>
       ))}
       {message && (

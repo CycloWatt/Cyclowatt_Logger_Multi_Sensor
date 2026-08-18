@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { appendFlashRecord, readFlashHistory, throughputKbps, type FlashRecord, type StringStore } from "./flash-history"
+import { appendFlashRecord, clearFlashHistory, readFlashHistory, throughputKbps, type FlashRecord, type StringStore } from "./flash-history"
 
 function memStore(initial?: string): StringStore {
   const map = new Map<string, string>()
@@ -31,6 +31,31 @@ describe("flash history", () => {
   it("computes throughput in kbit/s", () => {
     expect(throughputKbps(REC)).toBeCloseTo((313683 * 8) / 1000 / 20, 1)
     expect(throughputKbps({ ...REC, durationMs: 0 })).toBe(0)
+  })
+  it("clears the log, and the clear persists to the store", () => {
+    const store = memStore()
+    appendFlashRecord(REC, store)
+    appendFlashRecord({ ...REC, startedAt: 2000 }, store)
+    expect(readFlashHistory(store)).toHaveLength(2)
+
+    // Both halves matter: the returned value is what the caller renders, and the
+    // store is what survives a reload. An implementation that only did the former
+    // would look correct until the page was refreshed.
+    expect(clearFlashHistory(store)).toEqual([])
+    expect(readFlashHistory(store)).toEqual([])
+  })
+  it("is a no-op on an already-empty log", () => {
+    const store = memStore()
+    expect(clearFlashHistory(store)).toEqual([])
+    expect(readFlashHistory(store)).toEqual([])
+  })
+  it("leaves the log clearable after a clear (the key stays readable, not removed)", () => {
+    const store = memStore()
+    appendFlashRecord(REC, store)
+    clearFlashHistory(store)
+    appendFlashRecord({ ...REC, startedAt: 3000 }, store)
+    expect(readFlashHistory(store)).toHaveLength(1)
+    expect(readFlashHistory(store)[0].startedAt).toBe(3000)
   })
 })
 
@@ -77,5 +102,25 @@ describe("flash history default store", () => {
     // The unpersisted record still comes back, so a caller can render this run.
     expect(appendFlashRecord(REC, readOnly)).toHaveLength(1)
     expect(warn).toHaveBeenCalledOnce()
+  })
+
+  it("warns but does not throw when the CLEAR write fails", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const readOnly: StringStore = {
+      getItem: () => "[]",
+      setItem: () => {
+        throw new Error("QuotaExceededError")
+      },
+    }
+    // Reports empty regardless: the button's job is to leave the user looking at an
+    // empty list, and a storage failure it cannot fix must not become a red error
+    // in the middle of a DFU card.
+    expect(clearFlashHistory(readOnly)).toEqual([])
+    expect(warn).toHaveBeenCalledOnce()
+  })
+
+  it("degrades to a forgetful store when clearing with no window", () => {
+    expect("window" in globalThis).toBe(false)
+    expect(() => clearFlashHistory()).not.toThrow()
   })
 })

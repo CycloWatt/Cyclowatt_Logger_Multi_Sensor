@@ -71,6 +71,26 @@ export function appendFlashRecord(record: FlashRecord, store: StringStore = defa
 }
 
 /**
+ * Erase the log for this browser. Writes an empty array rather than removing the
+ * key, so StringStore keeps the two methods every caller and the test double
+ * already implement - a removeItem would have to be added to the interface for no
+ * behavioural gain, since readFlashHistory treats "[]" and a missing key alike.
+ *
+ * Same swallow-and-warn discipline as appendFlashRecord: the caller is a click
+ * handler inside the DFU card, and a storage exception escaping into React would
+ * take the whole logger page down through the root error boundary. Returns the
+ * empty log so a caller can render the return value directly.
+ */
+export function clearFlashHistory(store: StringStore = defaultStore()): FlashRecord[] {
+  try {
+    store.setItem(KEY, "[]")
+  } catch (err) {
+    console.warn("flash history: could not clear the log", err)
+  }
+  return []
+}
+
+/**
  * bytes*8/durationMs ≡ bytes*8/1000/seconds — kbit/s. 0 for a zero/absent duration.
  * Averaged over the END-TO-END flash (see the file header), so it reads well below
  * the raw link throughput; use it to compare runs, not to quantify the link.

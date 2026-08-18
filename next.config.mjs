@@ -8,9 +8,10 @@ const nextConfig = {
   eslint: {
     ignoreDuringBuilds: true,
   },
-  typescript: {
-    ignoreBuildErrors: true,
-  },
+  // typescript.ignoreBuildErrors was dropped once the repo went tsc-clean
+  // (Web Bluetooth / Web Serial types installed, chart.tsx typed for
+  // recharts 3) - the build now fails on a genuine type error instead of
+  // masking it.
   images: {
     unoptimized: true,
   },
