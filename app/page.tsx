@@ -14,6 +14,8 @@ import { SMP_SERVICE_UUID } from "@/lib/smp/client"
 import { BOARD_NAME_PREFIXES, BOARD_NAME_PREFIX_HINT, firmwareVersionFromName, isBoardName } from "@/lib/device-name"
 import { applyDeviceName, nextDisplayName } from "@/lib/device-list"
 import { readGapDeviceName } from "@/lib/gap-name"
+import { CPS_SERVICE_UUID } from "@/lib/cps/protocol"
+import { CalibrationCard } from "@/components/calibration-card"
 import { DfuCard } from "@/components/dfu-card"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 
@@ -419,8 +421,9 @@ export default function BluetoothDataLogger() {
   const CYCLOWATT_SERVICE_UUID = "5a1d0001-c7a1-4b2e-9e4f-1a2b3c4d5e6f"
   const CYCLOWATT_DATA_CHAR_UUID = "5a1d0002-c7a1-4b2e-9e4f-1a2b3c4d5e6f"
 
-  // Standard Cycling Power Service (CPS) UUIDs
-  const CPS_SERVICE_UUID = "00001818-0000-1000-8000-00805f9b34fb" // cycling_power
+  // Standard Cycling Power Service (CPS) UUIDs. The service id itself now comes
+  // from lib/cps/protocol, which the calibration flow shares - two copies of it
+  // could drift and the symptom would be a SecurityError seconds into a procedure.
   const CPS_MEASUREMENT_CHAR_UUID = "00002a63-0000-1000-8000-00805f9b34fb" // cycling_power_measurement
 
   // Expected packet: 16 x int32 = 64 bytes
@@ -893,6 +896,11 @@ export default function BluetoothDataLogger() {
             optionalServices: [
               CYCLOWATT_SERVICE_UUID,
               SMP_SERVICE_UUID,
+              // Cycling Power, for the Control Point that starts a calibration.
+              // Chrome scopes service access to what was declared HERE, so a grant
+              // made before this line existed stays locked out of calibration until
+              // the board is re-picked through Scan once.
+              CPS_SERVICE_UUID,
               "battery_service",
               "generic_access",
               "generic_attribute",
@@ -903,6 +911,11 @@ export default function BluetoothDataLogger() {
             optionalServices: [
               CYCLOWATT_SERVICE_UUID,
               SMP_SERVICE_UUID,
+              // Cycling Power, for the Control Point that starts a calibration.
+              // Chrome scopes service access to what was declared HERE, so a grant
+              // made before this line existed stays locked out of calibration until
+              // the board is re-picked through Scan once.
+              CPS_SERVICE_UUID,
               "battery_service",
               "generic_access",
               "generic_attribute",
@@ -1204,6 +1217,10 @@ export default function BluetoothDataLogger() {
         optionalServices: [
           SMP_SERVICE_UUID,
           CYCLOWATT_SERVICE_UUID,
+          // Cycling Power, so calibration is reachable in this mode too - which
+          // matters most here: a production image has no raw-stream service, so
+          // firmware-update-only is the ONLY way such a board connects at all.
+          CPS_SERVICE_UUID,
           "battery_service",
           "generic_access",
           "generic_attribute",
@@ -1779,6 +1796,12 @@ export default function BluetoothDataLogger() {
                 )}
               </CardContent>
             </Card>
+
+            {/* Zero-offset force calibration. Shown in BOTH connection modes on
+                purpose: a production image has no raw-stream service, so such a
+                board only ever connects here in firmware-update-only mode, and
+                that is exactly the board most likely to need a tare. */}
+            <CalibrationCard device={device} />
 
             {/* Statistics */}
             {connectionMode === "normal" && (

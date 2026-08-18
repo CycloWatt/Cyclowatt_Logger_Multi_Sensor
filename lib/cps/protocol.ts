@@ -51,8 +51,16 @@ export const CPS_RESPONSE_OPERATION_FAILED = 0x04
  * for anything else (cps_service.c:631), so padding it would fail rather than be
  * ignored.
  */
-export function startOffsetCompensationCommand(): Uint8Array {
-  return new Uint8Array([CPS_OPCODE_START_OFFSET_COMPENSATION])
+export function startOffsetCompensationCommand(): Uint8Array<ArrayBuffer> {
+  /*
+   * Built over an explicitly plain ArrayBuffer, and typed as such. Since
+   * TypeScript 5.7 a bare Uint8Array is generic over ArrayBufferLike, which
+   * includes SharedArrayBuffer and therefore does NOT satisfy the BufferSource
+   * that writeValueWithResponse() takes.
+   */
+  const command = new Uint8Array(new ArrayBuffer(1))
+  command[0] = CPS_OPCODE_START_OFFSET_COMPENSATION
+  return command
 }
 
 /**
