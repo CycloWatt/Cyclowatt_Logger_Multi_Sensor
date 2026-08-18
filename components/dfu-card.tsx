@@ -357,7 +357,24 @@ export function DfuCard({ device, isStreaming, stopStreaming, deviceName, onDevi
 
         {(phase === "uploading" || phase === "disconnected") && progress && (
           <div className="space-y-1">
-            <Progress value={percent} />
+            {/* Relative wrapper + top padding: the rider is taller than the h-4
+              * bar and needs headroom above the track. It cannot be nested inside
+              * <Progress> - that root sets overflow-hidden (see .chameleon-rider
+              * in app/globals.css). */}
+            <div className="relative pt-12">
+              <Progress value={percent} />
+              <div
+                className="chameleon-rider"
+                /* Just the percentage: the CSS centres the sprite on it, so this
+                 * stays correct whatever size the generated artwork turns out. */
+                style={{ left: `${percent}%` }}
+                /* Purely decorative - PHASE_TEXT and the KB/s line carry the real
+                 * status, so keep the rider out of the accessibility tree. */
+                aria-hidden
+                /* Pedalling stops when the upload is not actually advancing. */
+                data-stalled={phase === "disconnected" ? "" : undefined}
+              />
+            </div>
             <div className="text-xs text-gray-500">
               {(progress.sentBytes / 1024).toFixed(1)} / {(progress.totalBytes / 1024).toFixed(1)} KB
               {" · "}
