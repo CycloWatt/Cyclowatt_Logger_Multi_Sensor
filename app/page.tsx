@@ -15,7 +15,18 @@ import { BOARD_NAME_PREFIXES, BOARD_NAME_PREFIX_HINT, firmwareVersionFromName, i
 import { applyDeviceName, nextDisplayName } from "@/lib/device-list"
 import { readGapDeviceName } from "@/lib/gap-name"
 import { CPS_SERVICE_UUID } from "@/lib/cps/protocol"
-import { CalibrationCard } from "@/components/calibration-card"
+import { CalibrationCard, type CalibrationReading } from "@/components/calibration-card"
+import { CalibrationHistoryCard } from "@/components/calibration-history-card"
+import {
+  appendCalibrationRecord,
+  clearCalibrationHistory,
+  deleteCalibrationRecord,
+  isNewReadingForDevice,
+  newCalibrationRecord,
+  readCalibrationHistory,
+  type CalibrationRecord,
+} from "@/lib/calibration-history"
+import { readForceOffsets } from "@/lib/raw-stream/force-offsets"
 import { DfuCard } from "@/components/dfu-card"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 
@@ -259,6 +270,20 @@ export default function BluetoothDataLogger() {
   // FIRST board's name - a wrong board is worse than a stale version.
   const [connectedName, setConnectedName] = useState<{ id: string; name: string } | null>(null)
 
+  // The stored force-calibration readings for this browser. Owned HERE rather
+  // than in either card because two independent things write to it: a calibration
+  // run in the calibration card, and the connect-time read below. A card holding
+  // its own copy would show a stale table whenever the other writer moved.
+  //
+  // Starts empty and is filled by the effect below rather than read inline:
+  // localStorage does not exist during the Next prerender, and an initializer
+  // that touched it would make the server and client renders disagree.
+  const [calibrationHistory, setCalibrationHistory] = useState<CalibrationRecord[]>([])
+
+  useEffect(() => {
+    setCalibrationHistory(readCalibrationHistory())
+  }, [])
+
   const [serialPort, setSerialPort] = useState<SerialPort | null>(null)
   const [isSerialConnected, setIsSerialConnected] = useState(false)
   const [serialSupported, setSerialSupported] = useState<boolean>(true)
@@ -355,12 +380,93 @@ export default function BluetoothDataLogger() {
   // succeeds; a disconnect handler has nothing left to read over.
   const syncNameFromGatt = async (target: BluetoothDevice | null | undefined) => {
     const gapName = await readGapDeviceName(target)
-    if (!gapName || !target) return null
-    // applyDeviceName returns the same array when nothing changed, so React bails
-    // out instead of re-rendering.
-    setAvailableDevices((prev) => applyDeviceName(prev, target.id, gapName, "gap"))
-    setConnectedName({ id: target.id, name: gapName })
-    return gapName
+    if (gapName && target) {
+      // applyDeviceName returns the same array when nothing changed, so React bails
+      // out instead of re-rendering.
+      setAvailableDevices((prev) => applyDeviceName(prev, target.id, gapName, "gap"))
+      setConnectedName({ id: target.id, name: gapName })
+    }
+
+    // Log what the board already has stored, from the same open link. Not awaited:
+    // this is a bench nicety and every caller of this function is on the critical
+    // path of a connect, which must not wait on a second GATT round trip.
+    // Deliberately runs even when the name read failed - a reading filed under a
+    // fallback name is worth more than no reading.
+    void recordStoredCalibration(target, gapName)
+
+    return gapName ?? null
+  }
+
+  /**
+   * Read a freshly connected board's stored offsets into the calibration log.
+   *
+   * THE ANTI-SPAM RULE lives here: only a board whose state differs from the
+   * newest thing already logged about it produces a row. Reconnecting repeatedly
+   * to an unchanged board adds nothing, which is what keeps the handful of real
+   * calibrations visible among a bench afternoon's connects.
+   *
+   * The store, not React state, is what gets compared against - it is the source
+   * of truth, and reading it here avoids doing a localStorage write inside a
+   * state updater, which React would run twice in development and double-log.
+   */
+  const recordStoredCalibration = async (
+    target: BluetoothDevice | null | undefined,
+    gapName: string | null,
+  ) => {
+    if (!target) return
+
+    try {
+      const report = await readForceOffsets(target)
+      // null means this board does not serve per-channel detail at all (a
+      // production image). Nothing to log, and not a failure.
+      if (!report) return
+
+      const candidate = {
+        deviceId: target.id,
+        calibrated: report.calibrated,
+        offsetsMv: report.offsetsMv,
+      }
+      if (!isNewReadingForDevice(candidate, readCalibrationHistory())) return
+
+      setCalibrationHistory(
+        appendCalibrationRecord(
+          newCalibrationRecord({
+            ...candidate,
+            deviceName: gapName ?? target.name ?? "Unknown Device",
+            kind: "read",
+            recordedAt: Date.now(),
+            // Only a calibration RUN sees the Control Point's average.
+            avgOffsetN: null,
+          }),
+        ),
+      )
+    } catch (err) {
+      // Never surfaced as a connect failure: the link is up and everything else
+      // on this page works without the log.
+      console.warn("calibration history: could not read the board's stored offsets", err)
+    }
+  }
+
+  /** Record a calibration the operator just ran. Always logged - see below. */
+  const handleCalibrationReading = (reading: CalibrationReading) => {
+    if (!device) return
+
+    // No changed-since-last gate here, unlike the connect-time read: two runs
+    // producing identical values is a repeatability RESULT and the single most
+    // useful thing this log shows. Suppressing it would discard the measurement.
+    setCalibrationHistory(
+      appendCalibrationRecord(
+        newCalibrationRecord({
+          deviceId: device.id,
+          deviceName: displayedDeviceName,
+          kind: "calibration",
+          recordedAt: Date.now(),
+          calibrated: reading.calibrated,
+          offsetsMv: reading.offsetsMv,
+          avgOffsetN: reading.avgOffsetN,
+        }),
+      ),
+    )
   }
 
   // A completed flash renames the board, and the DFU card's post-reset reconnect is
@@ -1801,7 +1907,15 @@ export default function BluetoothDataLogger() {
                 purpose: a production image has no raw-stream service, so such a
                 board only ever connects here in firmware-update-only mode, and
                 that is exactly the board most likely to need a tare. */}
-            <CalibrationCard device={device} />
+            <CalibrationCard device={device} onReading={handleCalibrationReading} />
+
+            {/* Sits directly under the card that writes to it, so a run and its
+                new row are visible together without scrolling. */}
+            <CalibrationHistoryCard
+              records={calibrationHistory}
+              onDelete={(id) => setCalibrationHistory(deleteCalibrationRecord(id))}
+              onClear={() => setCalibrationHistory(clearCalibrationHistory())}
+            />
 
             {/* Statistics */}
             {connectionMode === "normal" && (
