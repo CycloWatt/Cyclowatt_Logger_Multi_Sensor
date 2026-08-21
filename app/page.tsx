@@ -9,7 +9,14 @@ import { Download, Wifi, WifiOff, AlertTriangle, Search, Cable } from "lucide-re
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
-import { SensorChartCard, isZoomed, type ChartLineDef, type ZoomRange } from "@/components/sensor-chart-card"
+import {
+  AUTO_AXIS,
+  SensorChartCard,
+  isZoomed,
+  type AxisRange,
+  type ChartLineDef,
+  type ZoomRange,
+} from "@/components/sensor-chart-card"
 import { SMP_SERVICE_UUID } from "@/lib/smp/client"
 import { BOARD_NAME_PREFIXES, BOARD_NAME_PREFIX_HINT, firmwareVersionFromName, isBoardName } from "@/lib/device-name"
 import { applyDeviceName, nextDisplayName } from "@/lib/device-list"
@@ -318,6 +325,16 @@ export default function BluetoothDataLogger() {
   const [accelZoom, setAccelZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
   const [gyroZoom, setGyroZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
   const [powerZoom, setPowerZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
+
+  // Per-chart Y-axis range. One state each, mirroring the zoom states above,
+  // so editing one chart's range leaves the other four memoized cards alone.
+  // All five start on the SHARED AUTO_AXIS constant - a fresh object literal
+  // per chart would be five distinct identities for the same default.
+  const [compressionRange, setCompressionRange] = useState<AxisRange>(AUTO_AXIS)
+  const [shearRange, setShearRange] = useState<AxisRange>(AUTO_AXIS)
+  const [accelRange, setAccelRange] = useState<AxisRange>(AUTO_AXIS)
+  const [gyroRange, setGyroRange] = useState<AxisRange>(AUTO_AXIS)
+  const [powerRange, setPowerRange] = useState<AxisRange>(AUTO_AXIS)
 
   // Per-line visibility for each chart
   const [lineVisibility, setLineVisibility] = useState<Record<string, boolean>>({
@@ -1959,7 +1976,9 @@ export default function BluetoothDataLogger() {
                   config={CHART_CONFIG}
                   visibility={lineVisibility}
                   zoom={compressionZoom}
+                  range={compressionRange}
                   onZoomChange={setCompressionZoom}
+                  onRangeChange={setCompressionRange}
                   onToggleLine={toggleLine}
                 />
                 <SensorChartCard
@@ -1969,7 +1988,9 @@ export default function BluetoothDataLogger() {
                   config={CHART_CONFIG}
                   visibility={lineVisibility}
                   zoom={shearZoom}
+                  range={shearRange}
                   onZoomChange={setShearZoom}
+                  onRangeChange={setShearRange}
                   onToggleLine={toggleLine}
                 />
                 <SensorChartCard
@@ -1979,7 +2000,9 @@ export default function BluetoothDataLogger() {
                   config={CHART_CONFIG}
                   visibility={lineVisibility}
                   zoom={accelZoom}
+                  range={accelRange}
                   onZoomChange={setAccelZoom}
+                  onRangeChange={setAccelRange}
                   onToggleLine={toggleLine}
                 />
                 <SensorChartCard
@@ -1989,7 +2012,9 @@ export default function BluetoothDataLogger() {
                   config={CHART_CONFIG}
                   visibility={lineVisibility}
                   zoom={gyroZoom}
+                  range={gyroRange}
                   onZoomChange={setGyroZoom}
+                  onRangeChange={setGyroRange}
                   onToggleLine={toggleLine}
                 />
                 <SensorChartCard
@@ -1999,7 +2024,9 @@ export default function BluetoothDataLogger() {
                   config={CHART_CONFIG}
                   visibility={lineVisibility}
                   zoom={powerZoom}
+                  range={powerRange}
                   onZoomChange={setPowerZoom}
+                  onRangeChange={setPowerRange}
                   onToggleLine={toggleLine}
                 />
               </div>
