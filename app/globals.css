@@ -118,7 +118,12 @@
   height: 48px;
   /* Scaling the strip by HEIGHT lets the frame width follow the source
    * proportions instead of being assumed square. */
-  background: url("/chameleon-cycle.png") 0 0 / auto 48px;
+  /* Relative, NOT root-absolute. The site is served from a basePath
+   * subdirectory, so "/chameleon-cycle.png" would resolve against the domain
+   * root and 404 on the deployed page. A relative URL is resolved by the CSS
+   * pipeline at build time and emitted with the correct prefix. Preserve this
+   * if the sprite block is ever regenerated. */
+  background: url("../public/chameleon-cycle.png") 0 0 / auto 48px;
   animation: chameleon-pedal 0.60s steps(8) infinite;
   /* Clears the h-4 (16px) bar so the rider sits ON TOP of the head. */
   bottom: 1rem;

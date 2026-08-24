@@ -1,66 +1,32 @@
 "use client"
 
 /**
- * Chooses the image to flash, from three sources — the shared shelf (firmware
- * repo via /api/firmware), the browser library (previous uploads), or a local
- * file. Every source funnels through parseMcubootImage before onImage fires;
- * local files are also saved to the library so they can be re-flashed later.
+ * Chooses the image to flash, from two sources - the browser library (previous
+ * uploads) or a local file. Every source funnels through parseMcubootImage
+ * before onImage fires; local files are also saved to the library so they can be
+ * re-flashed later.
+ *
+ * There is deliberately NO server-backed "version shelf" here. This app is
+ * built as a static export and hosted on GitHub Pages, which cannot run route
+ * handlers, so the old /api/firmware pair (a disk read of a local firmware
+ * checkout) could not survive. Released images live in the power-meter-fw repo
+ * under firmware_versions/; you download one and upload it here. The note in
+ * the upload section is the only remaining trace, and it is load-bearing: it is
+ * how someone finds the images at all.
  */
 
 import { useEffect, useRef, useState, type ChangeEvent } from "react"
 import { Button } from "@/components/ui/button"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
-import { ChevronDown, FileUp } from "lucide-react"
+import { FileUp } from "lucide-react"
 import { parseMcubootImage, type McubootImageInfo } from "@/lib/smp/mcuboot"
 import { deleteImage, getImageBytes, listImages, saveImage, type StoredImage } from "@/lib/firmware-library"
-import type { ShelfEntry } from "@/lib/firmware-shelf"
 
 interface ImagePickerProps {
   disabled: boolean
   onImage: (bytes: Uint8Array, info: McubootImageInfo, label: string) => void
 }
 
-/**
- * Shelf statuses are wire values, not prose. "missing-file" also covers a
- * manifest name that fails the bin-serving route's safe-name gate, so the label
- * says "not servable" rather than claiming the file is absent.
- */
-const STATUS_LABEL: Record<Exclude<ShelfEntry["status"], "ok">, string> = {
-  "missing-file": "not servable",
-  unlisted: "not in the manifest",
-}
-
-/**
- * Shelf entries grouped by version step ("0.1", "0.2", …) — one dropdown per
- * step. Unparsable versions (unlisted bins report "?") collect under "Other",
- * which sorts last; numeric steps sort ascending. Manifest order is kept
- * within a group.
- */
-function groupShelfByStep(shelf: ShelfEntry[]): Array<[string, ShelfEntry[]]> {
-  const groups = new Map<string, ShelfEntry[]>()
-  for (const entry of shelf) {
-    const step = entry.version.match(/^(\d+\.\d+)/)?.[1] ?? "Other"
-    const list = groups.get(step)
-    if (list) list.push(entry)
-    else groups.set(step, [entry])
-  }
-  return [...groups.entries()].sort(([a], [b]) => {
-    if (a === "Other") return 1
-    if (b === "Other") return -1
-    const [aMajor, aMinor] = a.split(".").map(Number)
-    const [bMajor, bMinor] = b.split(".").map(Number)
-    return aMajor - bMajor || aMinor - bMinor
-  })
-}
-
 export function ImagePicker({ disabled, onImage }: ImagePickerProps) {
-  const [shelf, setShelf] = useState<ShelfEntry[]>([])
-  const [shelfError, setShelfError] = useState("")
   const [library, setLibrary] = useState<StoredImage[]>([])
   const [sourceError, setSourceError] = useState("")
   // Mirror of what the card currently holds, kept only to make a stale selection
@@ -70,22 +36,8 @@ export function ImagePicker({ disabled, onImage }: ImagePickerProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
-    void refreshShelf()
     void refreshLibrary()
   }, [])
-
-  async function refreshShelf() {
-    try {
-      const rsp = await fetch("/api/firmware")
-      const body = await rsp.json()
-      if (!rsp.ok) throw new Error(body.error ?? `shelf request failed (${rsp.status})`)
-      setShelf(body.entries)
-      setShelfError("")
-    } catch (err) {
-      setShelf([])
-      setShelfError(err instanceof Error ? err.message : "shelf unavailable")
-    }
-  }
 
   async function refreshLibrary() {
     try {
@@ -119,16 +71,6 @@ export function ImagePicker({ disabled, onImage }: ImagePickerProps) {
     } catch (err) {
       failPick(err instanceof Error ? err.message : "invalid image")
       return null
-    }
-  }
-
-  async function pickShelf(entry: ShelfEntry) {
-    try {
-      const rsp = await fetch(`/api/firmware/${entry.file}`)
-      if (!rsp.ok) throw new Error(`download failed (${rsp.status})`)
-      accept(new Uint8Array(await rsp.arrayBuffer()), entry.file)
-    } catch (err) {
-      failPick(err instanceof Error ? err.message : "shelf download failed")
     }
   }
 
@@ -196,42 +138,6 @@ export function ImagePicker({ disabled, onImage }: ImagePickerProps) {
 
   return (
     <div className="space-y-3">
-      <div className="space-y-1">
-        <div className="text-sm font-medium">Version shelf (firmware repo)</div>
-        {shelfError && <div className="text-sm text-muted-foreground">{shelfError}</div>}
-        {shelf.length > 0 && (
-          <div className="flex flex-wrap gap-2">
-            {groupShelfByStep(shelf).map(([step, entries]) => (
-              <DropdownMenu key={step}>
-                <DropdownMenuTrigger asChild>
-                  <Button size="sm" variant="outline" disabled={disabled}>
-                    {step === "Other" ? "Other" : `v${step}.x`}
-                    <ChevronDown className="ml-1 h-4 w-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start">
-                  {entries.map((entry, index) => (
-                    // A manifest may list the same file twice, so the file name
-                    // alone is not a unique React key.
-                    <DropdownMenuItem
-                      key={`${entry.file}-${index}`}
-                      disabled={entry.status === "missing-file"}
-                      onSelect={() => void pickShelf(entry)}
-                    >
-                      <span>
-                        v{entry.version} — {entry.description}
-                        {entry.status !== "ok" && (
-                          <span className="text-destructive"> [{STATUS_LABEL[entry.status]}]</span>
-                        )}
-                      </span>
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            ))}
-          </div>
-        )}
-      </div>
       <div>
         <div className="text-sm font-medium">Previously uploaded</div>
         {library.length === 0 && <div className="text-sm text-muted-foreground">nothing stored yet</div>}
@@ -253,6 +159,11 @@ export function ImagePicker({ disabled, onImage }: ImagePickerProps) {
       </div>
       <div className="space-y-1">
         <div className="text-sm font-medium">Upload a .bin</div>
+        <div className="text-sm text-muted-foreground">
+          Released images live in the <span className="font-mono">power-meter-fw</span> repository under{" "}
+          <span className="font-mono">firmware_versions/</span>. Download the .bin for the version you want, then upload
+          it here.
+        </div>
         {/* Hidden native input; the visible control is a real Button so it matches
             the rest of the UI instead of the browser's locale-styled file widget. */}
         <input

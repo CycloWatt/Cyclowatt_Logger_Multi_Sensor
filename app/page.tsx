@@ -1,6 +1,10 @@
 "use client"
 
 import { useState, useRef, useEffect, useCallback } from "react"
+// Imported rather than written as "/logo_black.png": a static import is rewritten
+// to carry the basePath prefix, while a root-absolute literal would 404 on the
+// deployed Pages site, which is served from a subdirectory.
+import logoBlack from "@/public/logo_black.png"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -1642,7 +1646,7 @@ export default function BluetoothDataLogger() {
         <div className="container mx-auto px-6 py-8">
           <div className="flex items-center justify-between">
             <div className="flex items-center space-x-4">
-              <img src="/logo_black.png" alt="CycloWatt Logo" className="h-32 w-32 object-contain" />
+              <img src={logoBlack.src} alt="CycloWatt Logo" className="h-32 w-32 object-contain" />
               <div>
                 <h1 className="text-4xl font-bold tracking-tight text-white">CycloWatt</h1>
                 <p className="text-gray-300 text-lg font-medium">Bluetooth Data Streamer</p>

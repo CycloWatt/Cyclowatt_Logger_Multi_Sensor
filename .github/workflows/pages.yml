@@ -1,0 +1,61 @@
+# Builds the static export and publishes it to GitHub Pages.
+#
+# One-time repository setting this workflow cannot do for itself: Settings ->
+# Pages -> Build and deployment -> Source must be "GitHub Actions". While it is
+# still set to "Deploy from a branch" the deploy step has nothing to publish to.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    # Deliberately the working branch, not main: main has none of the firmware
+    # update code, so a site built from it would have no update path at all.
+    branches: [test_bench_improvements]
+  workflow_dispatch:
+
+# contents:read is the checkout; pages:write publishes; id-token:write is the
+# OIDC token that deploy-pages exchanges for its deployment credentials.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. cancel-in-progress stays false on purpose: killing a
+# deploy midway can leave the live site half-swapped.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Tests gate the deploy: a red commit must not reach the live page.
+      - run: npm test
+
+      # Emits out/ because next.config.mjs sets output: 'export'.
+      - run: npm run build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
