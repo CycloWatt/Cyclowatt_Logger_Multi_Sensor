@@ -94,6 +94,19 @@ describe("computeWindowStats", () => {
     expect(computeWindowStats(data, ["b", "a"], 0, 1).map((entry) => entry.key)).toEqual(["b", "a"])
   })
 
+  it("accurately computes statistics for combined channels", () => {
+    const force0 = [10, 20, 30]
+    const force2 = [5, 10, 15]
+    const force0_2 = force0.map((v, i) => v + force2[i])
+    const data = rows({ force0, force2, force0_2 })
+    const stats = statsFor(computeWindowStats(data, ["force0", "force2", "force0_2"], 0, 2), "force0_2")
+
+    expect(stats.count).toBe(3)
+    expect(stats.mean).toBe(30)
+    expect(stats.min).toBe(15)
+    expect(stats.max).toBe(45)
+  })
+
   it("marks an empty window as uncountable rather than zero", () => {
     // count 0 with NaN figures, so the readout can show "-". Reporting mean 0
     // would read as a measured zero.

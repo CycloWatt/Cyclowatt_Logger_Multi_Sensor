@@ -109,6 +109,7 @@ type ChartDataPoint = {
   force3: number
   force4: number
   force5: number
+  force0_2: number
   accelX: number
   accelY: number
   accelZ: number
@@ -152,6 +153,10 @@ const CHART_CONFIG = {
   force4: {
     label: "Compression Ch 4",
     color: "hsl(var(--chart-3))",
+  },
+  force0_2: {
+    label: "Combined Ch 0 + 2",
+    color: "hsl(var(--chart-4))",
   },
   force1: {
     label: "Shear Ch 1",
@@ -215,6 +220,7 @@ const COMPRESSION_LINES: readonly ChartLineDef[] = [
   { dataKey: "force0", name: "Channel 0" },
   { dataKey: "force2", name: "Channel 2" },
   { dataKey: "force4", name: "Channel 4" },
+  { dataKey: "force0_2", name: "Combined Ch 0 + 2" },
 ]
 const SHEAR_LINES: readonly ChartLineDef[] = [
   { dataKey: "force1", name: "Channel 1" },
@@ -341,6 +347,7 @@ export default function BluetoothDataLogger() {
     force0: true,
     force2: true,
     force4: true,
+    force0_2: false,
     force1: true,
     force3: true,
     force5: true,
@@ -714,6 +721,7 @@ export default function BluetoothDataLogger() {
       force3: point.force3,
       force4: point.force4,
       force5: point.force5,
+      force0_2: point.force0 + point.force2,
       accelX: Number(point.accelX.toFixed(3)),
       accelY: Number(point.accelY.toFixed(3)),
       accelZ: Number(point.accelZ.toFixed(3)),
