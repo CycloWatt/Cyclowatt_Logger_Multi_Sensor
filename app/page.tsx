@@ -38,6 +38,12 @@ import {
   type CalibrationRecord,
 } from "@/lib/calibration-history"
 import { readForceOffsets } from "@/lib/raw-stream/force-offsets"
+import {
+  FORCE_SLOTS_FIRST,
+  FORCE_SLOTS_SECOND,
+  forceChannelLabel,
+  forceDataKey,
+} from "@/lib/raw-stream/force-channels"
 import { DfuCard } from "@/components/dfu-card"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 
@@ -146,33 +152,39 @@ interface AvailableDevice {
 // per render would defeat the memo and re-render five recharts trees on every
 // unrelated state change (serial line, battery update, reference power).
 const CHART_CONFIG = {
+  // Force labels come from lib/raw-stream/force-channels.ts, never from the index
+  // itself: the rule this replaced derived them arithmetically (even channel =
+  // compression, odd = shear) and got channels 1 and 4 wrong, on both this screen
+  // and the calibration readout. Colour is keyed to POSITION rather than to the
+  // card, so front-right is the same colour on both force graphs and the two
+  // channels of one load cell are visually a pair.
   force0: {
-    label: "Compression Ch 0",
+    label: forceChannelLabel(0),
     color: "hsl(var(--chart-1))",
-  },
-  force2: {
-    label: "Compression Ch 2",
-    color: "hsl(var(--chart-2))",
-  },
-  force4: {
-    label: "Compression Ch 4",
-    color: "hsl(var(--chart-3))",
-  },
-  force0_2: {
-    label: "Combined Ch 0 + 2",
-    color: "hsl(var(--chart-4))",
   },
   force1: {
-    label: "Shear Ch 1",
-    color: "hsl(var(--chart-1))",
+    label: forceChannelLabel(1),
+    color: "hsl(var(--chart-2))",
+  },
+  force2: {
+    label: forceChannelLabel(2),
+    color: "hsl(var(--chart-3))",
   },
   force3: {
-    label: "Shear Ch 3",
+    label: forceChannelLabel(3),
+    color: "hsl(var(--chart-1))",
+  },
+  force4: {
+    label: forceChannelLabel(4),
     color: "hsl(var(--chart-2))",
   },
   force5: {
-    label: "Shear Ch 5",
+    label: forceChannelLabel(5),
     color: "hsl(var(--chart-3))",
+  },
+  force0_2: {
+    label: "Sum front (Ch 0 + 2)",
+    color: "hsl(var(--chart-4))",
   },
   // Units below follow the firmware's wire contract: it packs accel in milli-g
   // and gyro in milli-rad/s, and parseDataPacket divides both by 1000. So these
@@ -220,17 +232,20 @@ const CHART_CONFIG = {
   },
 } satisfies ChartConfig
 
-const COMPRESSION_LINES: readonly ChartLineDef[] = [
-  { dataKey: "force0", name: "Channel 0" },
-  { dataKey: "force2", name: "Channel 2" },
-  { dataKey: "force4", name: "Channel 4" },
-  { dataKey: "force0_2", name: "Combined Ch 0 + 2" },
+// The two force graphs split the six channels by which of a load cell's two amp
+// outputs they are, NOT by axis: slots 0/1/2 are the first output of front-right,
+// back and front-left, slots 3/4/5 the second. Which of a position's two channels
+// carries compression and which shear depends on how the cell is soldered to the
+// amp inputs, so neither the names nor the titles here claim an axis - see the
+// header of lib/raw-stream/force-channels.ts.
+const FORCE_LINES_A: readonly ChartLineDef[] = [
+  ...FORCE_SLOTS_FIRST.map((slot) => ({ dataKey: forceDataKey(slot), name: forceChannelLabel(slot) })),
+  { dataKey: "force0_2", name: "Sum front (Ch 0 + 2)" },
 ]
-const SHEAR_LINES: readonly ChartLineDef[] = [
-  { dataKey: "force1", name: "Channel 1" },
-  { dataKey: "force3", name: "Channel 3" },
-  { dataKey: "force5", name: "Channel 5" },
-]
+const FORCE_LINES_B: readonly ChartLineDef[] = FORCE_SLOTS_SECOND.map((slot) => ({
+  dataKey: forceDataKey(slot),
+  name: forceChannelLabel(slot),
+}))
 const ACCEL_LINES: readonly ChartLineDef[] = [
   { dataKey: "accelX", name: "Accel X" },
   { dataKey: "accelY", name: "Accel Y" },
@@ -330,8 +345,8 @@ export default function BluetoothDataLogger() {
     packetsPerSecond: 0,
   })
 
-  const [compressionZoom, setCompressionZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
-  const [shearZoom, setShearZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
+  const [forceAZoom, setForceAZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
+  const [forceBZoom, setForceBZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
   const [accelZoom, setAccelZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
   const [gyroZoom, setGyroZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
   const [powerZoom, setPowerZoom] = useState<{ startIndex?: number; endIndex?: number }>({})
@@ -340,8 +355,8 @@ export default function BluetoothDataLogger() {
   // so editing one chart's range leaves the other four memoized cards alone.
   // All five start on the SHARED AUTO_AXIS constant - a fresh object literal
   // per chart would be five distinct identities for the same default.
-  const [compressionRange, setCompressionRange] = useState<AxisRange>(AUTO_AXIS)
-  const [shearRange, setShearRange] = useState<AxisRange>(AUTO_AXIS)
+  const [forceARange, setForceARange] = useState<AxisRange>(AUTO_AXIS)
+  const [forceBRange, setForceBRange] = useState<AxisRange>(AUTO_AXIS)
   const [accelRange, setAccelRange] = useState<AxisRange>(AUTO_AXIS)
   const [gyroRange, setGyroRange] = useState<AxisRange>(AUTO_AXIS)
   const [powerRange, setPowerRange] = useState<AxisRange>(AUTO_AXIS)
@@ -349,12 +364,12 @@ export default function BluetoothDataLogger() {
   // Per-line visibility for each chart
   const [lineVisibility, setLineVisibility] = useState<Record<string, boolean>>({
     force0: true,
-    force2: true,
-    force4: true,
-    force0_2: false,
     force1: true,
+    force2: true,
     force3: true,
+    force4: true,
     force5: true,
+    force0_2: false,
     accelX: true,
     accelY: true,
     accelZ: true,
@@ -725,6 +740,11 @@ export default function BluetoothDataLogger() {
       force3: point.force3,
       force4: point.force4,
       force5: point.force5,
+      // The two FRONT cells, front-right (Ch 0) + front-left (Ch 2): they sit on
+      // the same axis on the bench, so their combined load is what the readout
+      // wants. A position pair, deliberately - not "the first two compression
+      // channels", which is what this sum was mistaken for while the labels still
+      // claimed an axis per channel.
       force0_2: point.force0 + point.force2,
       accelX: Number(point.accelX.toFixed(3)),
       accelY: Number(point.accelY.toFixed(3)),
@@ -1384,13 +1404,19 @@ export default function BluetoothDataLogger() {
     }
 
     try {
-      // 6 force channels (load cell values) — raw integers, not scaled
-      const force0 = dataView.getInt32(0, true) // index 0 — compression
-      const force1 = dataView.getInt32(4, true) // index 1 — shear
-      const force2 = dataView.getInt32(8, true) // index 2 — compression
-      const force3 = dataView.getInt32(12, true) // index 3 — shear
-      const force4 = dataView.getInt32(16, true) // index 4 — compression
-      const force5 = dataView.getInt32(20, true) // index 5 — shear
+      // 6 force channels (load cell values) — raw integers, not scaled.
+      //
+      // The wire slot IS the board's amp channel: the firmware reads Vout_meas_1..6
+      // into force_mv[0..5] straight (power-meter-fw src/drivers/force_sensor.c)
+      // and raw_stream_wire.c packs slot i to slot i, so no permutation happens
+      // anywhere between the ADC and here. Positions per slot live in
+      // lib/raw-stream/force-channels.ts — the one place that mapping is written.
+      const force0 = dataView.getInt32(0, true) // index 0 — front-right (J2)
+      const force1 = dataView.getInt32(4, true) // index 1 — back (J4)
+      const force2 = dataView.getInt32(8, true) // index 2 — front-left (J5)
+      const force3 = dataView.getInt32(12, true) // index 3 — front-right (J2)
+      const force4 = dataView.getInt32(16, true) // index 4 — back (J4)
+      const force5 = dataView.getInt32(20, true) // index 5 — front-left (J5)
 
       // Accel — packed as milli-g, so /1000 yields g
       const accelX = dataView.getInt32(24, true) / 1000 // index 6
@@ -1632,8 +1658,8 @@ export default function BluetoothDataLogger() {
   }
 
   const resetAllZoom = () => {
-    setCompressionZoom({})
-    setShearZoom({})
+    setForceAZoom({})
+    setForceBZoom({})
     setAccelZoom({})
     setGyroZoom({})
     setPowerZoom({})
@@ -1982,27 +2008,27 @@ export default function BluetoothDataLogger() {
             {connectionMode === "normal" && (
               <div className="grid grid-cols-1 gap-6">
                 <SensorChartCard
-                  title="Compression Force (Channels 0, 2, 4)"
-                  lines={COMPRESSION_LINES}
+                  title="Force - first channel per position (Channels 0, 1, 2)"
+                  lines={FORCE_LINES_A}
                   data={chartData}
                   config={CHART_CONFIG}
                   visibility={lineVisibility}
-                  zoom={compressionZoom}
-                  range={compressionRange}
-                  onZoomChange={setCompressionZoom}
-                  onRangeChange={setCompressionRange}
+                  zoom={forceAZoom}
+                  range={forceARange}
+                  onZoomChange={setForceAZoom}
+                  onRangeChange={setForceARange}
                   onToggleLine={toggleLine}
                 />
                 <SensorChartCard
-                  title="Shear Force (Channels 1, 3, 5)"
-                  lines={SHEAR_LINES}
+                  title="Force - second channel per position (Channels 3, 4, 5)"
+                  lines={FORCE_LINES_B}
                   data={chartData}
                   config={CHART_CONFIG}
                   visibility={lineVisibility}
-                  zoom={shearZoom}
-                  range={shearRange}
-                  onZoomChange={setShearZoom}
-                  onRangeChange={setShearRange}
+                  zoom={forceBZoom}
+                  range={forceBRange}
+                  onZoomChange={setForceBZoom}
+                  onRangeChange={setForceBRange}
                   onToggleLine={toggleLine}
                 />
                 <SensorChartCard
@@ -2056,7 +2082,7 @@ export default function BluetoothDataLogger() {
                     onClick={resetAllZoom}
                     /* isZoomed, not startIndex truthiness: a brush that starts on
                        the very first sample (index 0) is still a zoom. */
-                    disabled={![compressionZoom, shearZoom, accelZoom, gyroZoom, powerZoom].some(isZoomed)}
+                    disabled={![forceAZoom, forceBZoom, accelZoom, gyroZoom, powerZoom].some(isZoomed)}
                   >
                     Reset All Zoom
                   </Button>

@@ -27,6 +27,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { runOffsetCompensation } from "@/lib/cps/calibration"
 import { readForceOffsets, type ForceOffsetsReport } from "@/lib/raw-stream/force-offsets"
+import { forceChannelLabel } from "@/lib/raw-stream/force-channels"
 
 /**
  * One observed board state, handed upward to be logged.
@@ -176,13 +177,12 @@ export function CalibrationCard({ device, busy = false, onReading }: Calibration
                 {offsets.offsetsMv.map((mv, channel) => (
                   <tr key={channel}>
                     {/*
-                      Compression on the even channels, shear on the odd ones - the
-                      same grouping the streaming force charts use, so the two
-                      screens name the same channel the same way.
+                      Named from the SAME table the streaming force charts use, so
+                      the two screens name a channel identically. That was the point
+                      of the even/odd rule this replaced too - it just named four of
+                      the six wrong, on both screens at once.
                     */}
-                    <td className="pr-4 text-muted-foreground">
-                      Channel {channel} ({channel % 2 === 0 ? "compression" : "shear"})
-                    </td>
+                    <td className="pr-4 text-muted-foreground">{forceChannelLabel(channel)}</td>
                     <td className="tabular-nums text-right">{mv} mV</td>
                   </tr>
                 ))}
