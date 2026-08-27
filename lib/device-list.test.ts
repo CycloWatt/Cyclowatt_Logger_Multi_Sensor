@@ -85,27 +85,22 @@ describe("applyDeviceName", () => {
     expect(applyDeviceName(entries, "missing", "Something Else", "gap")).toBe(entries)
   })
 
-  it("applies a patch alongside the name", () => {
-    const entries = [{ id: "a", name: "CRaw L B2C3 v0.5.0", inRange: false }]
-    const result = applyDeviceName(entries, "a", "CRaw L B2C3 v0.6.0", "gap", { inRange: true })
-    expect(result[0]).toEqual({ id: "a", name: "CRaw L B2C3 v0.6.0", inRange: true })
+  it("carries a row's other fields through a rename", () => {
+    const entries = [{ id: "a", name: "CRaw L B2C3 v0.5.0", hasTargetService: true }]
+    const result = applyDeviceName(entries, "a", "CRaw L B2C3 v0.6.0", "gap")
+    expect(result[0]).toEqual({ id: "a", name: "CRaw L B2C3 v0.6.0", hasTargetService: true })
   })
 
-  it("applies a patch even when the name did not change", () => {
-    // First advertisement from a board whose name was already right still has to
-    // latch the "(in range)" evidence.
-    const entries = [{ id: "a", name: "CRaw L B2C3", inRange: false }]
-    const result = applyDeviceName(entries, "a", "CRaw L B2C3", "advertisement", { inRange: true })
+  it("leaves untouched rows with their own identity", () => {
+    // What keeps memoized children of the OTHER rows from re-rendering when one
+    // row is renamed.
+    const entries = [
+      { id: "a", name: "CRaw L B2C3 v0.5.0" },
+      { id: "b", name: "CRaw R 9D4E v0.5.0" },
+    ]
+    const result = applyDeviceName(entries, "a", "CRaw L B2C3 v0.6.0", "gap")
     expect(result).not.toBe(entries)
-    expect(result[0].inRange).toBe(true)
-  })
-
-  it("returns the SAME array once the patch is already satisfied", () => {
-    // The repeat-advertisement steady state: name right, inRange already latched.
-    const entries = [{ id: "a", name: "CRaw L B2C3", inRange: true }]
-    expect(applyDeviceName(entries, "a", "CRaw L B2C3", "advertisement", { inRange: true })).toBe(
-      entries,
-    )
+    expect(result[1]).toBe(entries[1])
   })
 
   it("handles an empty list", () => {

@@ -131,20 +131,22 @@ type ChartDataPoint = {
   synchronization: number
 }
 
+/**
+ * A board this session has opened a link to. The list built from these is
+ * deliberately NOT a discovery list: it shows the CONNECTED board and nothing
+ * else. Rows for boards that were merely remembered (a past permission grant
+ * from navigator.bluetooth.getDevices()) or merely seen on the air (an
+ * advertisement, via watchAdvertisements) used to live here too, and on a bench
+ * with many flashed boards that pile of "(remembered)" rows - none of which is
+ * evidence the board is even powered on - buried the one row that mattered.
+ * Both sources are gone; a board reaches this list only by being picked through
+ * the chooser, which connects it straight away.
+ */
 interface AvailableDevice {
   device: BluetoothDevice
   name: string
   id: string
   hasTargetService: boolean
-  // true = came from Chrome's list of already-granted devices (getDevices()) rather
-  // than from a fresh chooser pick, so the row can say so: it is a permission
-  // record, NOT evidence the board is powered on or in range right now.
-  remembered: boolean
-  // true = an advertisement from this device has been SEEN this page session
-  // (via watchAdvertisements, where the engine supports it) - upgrades the
-  // "(remembered)" caveat to positive evidence the board is on and in range.
-  // Latched, deliberately: it means "seen since load", not "seen just now".
-  inRange?: boolean
 }
 
 // Chart styling/labels and the five charts' line sets, at module scope so the
@@ -529,6 +531,32 @@ export default function BluetoothDataLogger() {
     device?.name ||
     "Unknown Device"
 
+  // The single row the device list renders: the board currently CONNECTED, or
+  // nothing at all.
+  //
+  // Derived from the connection state rather than by filtering availableDevices
+  // on `gatt.connected`, because that property is not React state - a list
+  // filtered on it would go on rendering a row for a board that had already
+  // dropped, until some unrelated state change happened to force a re-render.
+  // isConnected/device change on every connect and every disconnect route
+  // (handleDisconnection), which is exactly when this row must appear or go.
+  const connectedDeviceRow = (() => {
+    if (!isConnected || !device) return null
+    const known = availableDevices.find((d) => d.id === device.id)
+    return {
+      id: device.id,
+      // The row's own name, kept current by lib/device-list.ts from Device Name
+      // reads. displayedDeviceName is the fallback for the same reason it exists
+      // at all: Chrome's frozen BluetoothDevice.name is the last resort, never
+      // the first choice.
+      name: known?.name || displayedDeviceName,
+      // Only a scan MEASURES this. A firmware-update-only connect registers its
+      // row without probing services, so that row simply shows no badge rather
+      // than claiming incompatibility it never checked.
+      hasTargetService: known?.hasTargetService ?? false,
+    }
+  })()
+
   // Refs for efficient data handling
   const dataBufferRef = useRef<DataPoint[]>([])
   // The charts' own rolling buffer, fed on every packet regardless of the CSV
@@ -612,112 +640,6 @@ export default function BluetoothDataLogger() {
     if (!window.isSecureContext) {
       console.error("Not in secure context")
       setError("Bluetooth and Serial require HTTPS. Please access this page via HTTPS or localhost.")
-    }
-  }, [])
-
-  // List devices the user already granted access to, so repeat flash/test cycles skip
-  // the chooser after every page reload. Chrome keeps these grants per-origin and
-  // exposes them via navigator.bluetooth.getDevices(); it is NOT in the Web Bluetooth
-  // spec's baseline, so it is feature-detected rather than assumed.
-  //
-  // Caveats intentionally accepted: the list is every past grant on this origin — it can
-  // include non-CycloWatt devices and devices whose `gatt` is undefined, and it says
-  // nothing about whether a board is powered on or in range. Entries therefore get
-  // hasTargetService: false (same as an unprobed scan hit) and only turn "Compatible"
-  // once a real scan probes their services.
-  useEffect(() => {
-    const bt = navigator.bluetooth as (Bluetooth & { getDevices?: () => Promise<BluetoothDevice[]> }) | undefined
-    if (!bt?.getDevices) return
-    // One controller stops every advertisement watch this effect starts, and
-    // the listener list lets cleanup detach what was attached (React StrictMode
-    // mounts effects twice in dev - without this the listeners would stack).
-    const watchAbort = new AbortController()
-    const advertisementListeners: Array<[BluetoothDevice, (event: Event) => void]> = []
-    void bt
-      .getDevices()
-      .then((granted) => {
-        setAvailableDevices((prev) => {
-          // Never overwrite an entry a scan already probed — its hasTargetService is
-          // real information, and this effect has none to offer.
-          const known = new Set(prev.map((d) => d.id))
-          const remembered = granted
-            .filter((d) => !known.has(d.id))
-            .map((device) => ({
-              device,
-              name: device.name || "Unknown Device",
-              id: device.id,
-              hasTargetService: false,
-              remembered: true,
-            }))
-          return [...prev, ...remembered]
-        })
-
-        // Passive presence, where the engine offers watchAdvertisements (it is
-        // feature-detected: Chrome still gates it behind a flag). Each received
-        // advertisement is positive evidence the board is powered on and in
-        // range - the row upgrades from "(remembered)" to "(in range)" - and it
-        // carries the board's CURRENT advertised name, so a board renamed by a
-        // flash corrects its row without anyone connecting to it.
-        let watching = 0
-        for (const grantedDevice of granted) {
-          const watchable = grantedDevice as BluetoothDevice & {
-            watchAdvertisements?: (options?: { signal?: AbortSignal }) => Promise<void>
-          }
-          if (typeof watchable.watchAdvertisements !== "function") continue
-          watching += 1
-          const onAdvertisement = (event: Event) => {
-            // Structural read of BluetoothAdvertisingEvent.name - per-event data
-            // straight off the air, and the freshest name available pre-connect.
-            //
-            // Deliberately NOT falling back to grantedDevice.name: that is the
-            // name Chrome froze at grant time, so falling back to it would let a
-            // repeating advertisement re-assert a stale name over a corrected row.
-            // An advertisement carrying no name simply carries no name news, and
-            // applyDeviceName ignores an empty candidate while still latching
-            // inRange.
-            const advertisedName = (event as Event & { name?: string }).name
-            // The "advertisement" origin is what stops a data-acquisition board's
-            // truncated 11-char on-air name from displacing the fuller name a
-            // Device Name read already established. applyDeviceName also returns
-            // the same array when nothing changed, which matters here:
-            // advertisements repeat several times a second.
-            setAvailableDevices((prev) =>
-              applyDeviceName(prev, grantedDevice.id, advertisedName, "advertisement", {
-                inRange: true,
-              }),
-            )
-          }
-          grantedDevice.addEventListener("advertisementreceived", onAdvertisement)
-          advertisementListeners.push([grantedDevice, onAdvertisement])
-          watchable.watchAdvertisements({ signal: watchAbort.signal }).catch(() => {
-            // Unsupported despite the function existing, or the watch was
-            // aborted - either way the row simply stays "(remembered)".
-          })
-        }
-
-        // Whether a remembered row can correct its own name WITHOUT connecting
-        // comes down to this count, so say so once rather than leave an operator
-        // wondering why a reflashed board still shows its old version. Zero is the
-        // normal state in stable Chrome: watchAdvertisements() is still behind
-        // chrome://flags/#enable-experimental-web-platform-features. With it off, a
-        // remembered row shows the name Chrome cached at grant time until something
-        // opens a link (Scan, Connect, or DFU connect), which reads the name from
-        // the board itself.
-        if (watching > 0) {
-          console.log(`Passive name refresh active on ${watching}/${granted.length} remembered device(s).`)
-        } else if (granted.length > 0) {
-          console.log(
-            "Passive name refresh unavailable (watchAdvertisements is flag-gated) - " +
-              `${granted.length} remembered device(s) show their cached name until connected.`,
-          )
-        }
-      })
-      .catch(() => {}) // permission-API hiccups are non-fatal — the user can still Scan
-    return () => {
-      watchAbort.abort()
-      for (const [watchedDevice, listener] of advertisementListeners) {
-        watchedDevice.removeEventListener("advertisementreceived", listener)
-      }
     }
   }, [])
 
@@ -1089,6 +1011,10 @@ export default function BluetoothDataLogger() {
       // the whole row, which is how picking a board through the chooser used to
       // undo a name an advertisement had already corrected.
       let gapName: string | null = null
+      // true = the probe left its GATT link OPEN for the auto-connect to adopt.
+      // Passed on so a failed connect knows the open link is THIS flow's to
+      // release, and not another session's to leave alone.
+      let probeLinkOpen = false
       try {
         if (device.gatt) {
           const server = await device.gatt.connect()
@@ -1131,8 +1057,22 @@ export default function BluetoothDataLogger() {
             console.warn("Could not scan services:", serviceErr)
           }
 
-          await server.disconnect()
-          console.log("🔌 Disconnected after scanning")
+          // A compatible board is about to be connected for real (see the
+          // auto-connect below), so its probe link is HANDED OVER rather than
+          // dropped: disconnecting and immediately re-connecting the same device
+          // is the Web Bluetooth pattern that intermittently rejects with "GATT
+          // operation already in progress", and it costs a second of bench time
+          // on every scan. Anything else - a production image, or a probe that
+          // threw before finding the service - is released here, because nothing
+          // downstream will claim it and the board has ONE peripheral slot: a
+          // dangling link stops it advertising and locks out the coupled shoe.
+          if (hasTargetService) {
+            probeLinkOpen = true
+            console.log("🔗 Keeping the scan link open to connect")
+          } else {
+            await server.disconnect()
+            console.log("🔌 Disconnected after scanning")
+          }
         }
       } catch (connectErr) {
         console.warn("Could not connect for service scanning:", connectErr)
@@ -1144,10 +1084,6 @@ export default function BluetoothDataLogger() {
         name: gapName || device.name || "Unknown Device",
         id: device.id,
         hasTargetService,
-        // Picked through the chooser in this session — the row shows live scan
-        // results, so no "(remembered)" hint. This also intentionally clears the
-        // flag when a re-scan replaces a remembered entry (see the merge below).
-        remembered: false,
       }
 
       setAvailableDevices((prev) => {
@@ -1155,10 +1091,10 @@ export default function BluetoothDataLogger() {
         if (existing) {
           // Every other field on the rebuilt row is fresher than the old one, but
           // the NAME may not be: if the GAP read failed, newDevice.name fell back
-          // to Chrome's frozen cache, which must not displace a name an
-          // advertisement already corrected. Origin "gap" only when the read
-          // actually succeeded, since only an authoritative read earns the right
-          // to shorten the name already on the row.
+          // to Chrome's frozen cache, which must not displace a name a previous
+          // Device Name read already established. Origin "gap" only when this
+          // read actually succeeded, since only an authoritative read earns the
+          // right to shorten the name already on the row.
           const name = nextDisplayName(existing.name, newDevice.name, gapName ? "gap" : "advertisement")
           return prev.map((d) => (d.id === device.id ? { ...newDevice, name } : d))
         }
@@ -1166,6 +1102,23 @@ export default function BluetoothDataLogger() {
       })
 
       console.log(`\n📋 Device added to list: ${newDevice.name} (Target Service: ${hasTargetService ? "✅" : "❌"})`)
+
+      // Straight into the session. The list shows connected boards only, so a
+      // picked-but-idle board would be invisible and there would be nothing left
+      // to press Connect on - the chooser pick IS the connect gesture now.
+      //
+      // Gated on the probe above: connectToSpecificDevice needs the raw-stream
+      // service and a production image has none, so auto-connecting one would
+      // only produce a GATT lookup failure. Say what to do about it instead.
+      if (hasTargetService) {
+        await connectToSpecificDevice(newDevice, { ownsOpenLink: probeLinkOpen })
+      } else {
+        setError(
+          `${newDevice.name} does not expose the raw-stream service, so it cannot be logged. ` +
+            `It is most likely running a production image - use "Connect (firmware-update-only)" ` +
+            `on the Firmware Update tab to reach it.`,
+        )
+      }
     } catch (err) {
       console.error("Device scan failed:", err)
       setError(`Scan failed: ${err instanceof Error ? err.message : "Unknown error"}`)
@@ -1174,8 +1127,16 @@ export default function BluetoothDataLogger() {
     }
   }
 
-  // Connect to a specific device
-  const connectToSpecificDevice = async (selectedDevice: AvailableDevice) => {
+  // Connect to a specific device.
+  //
+  // `ownsOpenLink` is set by the scan path, which probes over a GATT link and
+  // hands it straight to this call rather than closing it. It only affects
+  // FAILURE handling: it tells the catch that an already-open link belongs to
+  // this flow and may be released. See alreadyLinked.
+  const connectToSpecificDevice = async (
+    selectedDevice: AvailableDevice,
+    { ownsOpenLink = false }: { ownsOpenLink?: boolean } = {},
+  ) => {
     // Distinguishes "the link never came up" from "the link came up but the board isn't
     // what we expected" — the two need different error copy (see the catch).
     let gattConnected = false
@@ -1189,12 +1150,13 @@ export default function BluetoothDataLogger() {
     // Was the link ALREADY up before this call? gatt.connect() on an
     // already-connected server resolves instantly as a no-op, so gattConnected
     // alone cannot tell "this call opened the link" from "someone else's link
-    // was already open". Without this, misclicking the remembered row of the
-    // live reference CPS meter — whose session is tracked by isRefConnected,
-    // not isConnected, so the Connect button stays enabled — would make the
-    // catch below tear down the reference capture mid-recording. Only release
-    // a link this call actually opened.
-    const alreadyLinked = !!selectedDevice.device.gatt?.connected
+    // was already open". Without this, picking the LIVE reference CPS meter out
+    // of the chooser — its session is tracked by isRefConnected, not
+    // isConnected, so nothing here knows it is in use — would make the catch
+    // below tear down the reference capture mid-recording. Only release a link
+    // this call actually opened, or one the caller has explicitly handed over
+    // (see ownsOpenLink).
+    const alreadyLinked = !!selectedDevice.device.gatt?.connected && !ownsOpenLink
     try {
       setError("")
       console.log(`\n🔗 CONNECTING TO: ${selectedDevice.name}`)
@@ -1383,6 +1345,28 @@ export default function BluetoothDataLogger() {
       })
       await dfuDevice.gatt!.connect()
       console.log(`✅ DFU-only connection to: ${dfuDevice.name || "Unknown"} (${dfuDevice.id})`)
+      // Register the row this mode connects through, so the connected-device list
+      // is right in BOTH modes. It used to be populated only by Scan, which was
+      // invisible while the list also carried every remembered device; now that a
+      // row means "this is the connected board", a missing one is a lie.
+      // hasTargetService stays false - nothing here probed for it, and a board
+      // reached this way most often genuinely lacks it.
+      setAvailableDevices((prev) => {
+        // An existing row is left ALONE rather than rebuilt. Everything this path
+        // could put on it is worse than what is already there: its name is
+        // Chrome's cache, frozen at grant time, and its hasTargetService is a
+        // guess where a scan's is a measurement.
+        if (prev.some((d) => d.id === dfuDevice.id)) return prev
+        return [
+          ...prev,
+          {
+            device: dfuDevice,
+            name: dfuDevice.name || "Unknown Device",
+            id: dfuDevice.id,
+            hasTargetService: false,
+          },
+        ]
+      })
       setDevice(dfuDevice)
       setIsConnected(true)
       setConnectionMode("dfu")
@@ -1875,7 +1859,10 @@ export default function BluetoothDataLogger() {
                     onClick={scanForDevices}
                     disabled={!bluetoothSupported || !isSecureContext || isScanning || isConnected}
                   >
-                    {isScanning ? "Scanning..." : "Scan for Devices"}
+                    {/* One gesture now: the chooser pick is the connect, so the
+                        label says so rather than promising a list to choose from
+                        afterwards. */}
+                    {isScanning ? "Connecting..." : "Scan & Connect"}
                   </Button>
                   {isConnected && (
                     <Button variant="outline" onClick={disconnect}>
@@ -1902,44 +1889,31 @@ export default function BluetoothDataLogger() {
                   </div>
                 )}
 
-                {availableDevices.length > 0 && (
+                {/* Connected boards ONLY. This used to be an "Available Devices"
+                    list carrying every past permission grant, which on a bench
+                    with a dozen flashed boards was a dozen rows saying nothing
+                    more than "Chrome remembers this one" - and the row an
+                    operator actually needed was somewhere inside it. The chooser
+                    now doubles as the connect gesture (see scanForDevices), so a
+                    row here always means a live link. */}
+                {connectedDeviceRow && (
                   <div className="space-y-2">
-                    <h3 className="text-sm font-medium">Available Devices:</h3>
-                    <div className="grid gap-2">
-                      {availableDevices.map((availableDevice) => (
-                        <div key={availableDevice.id} className="flex items-center justify-between p-3 border rounded-lg">
-                          <div className="flex items-center gap-3">
-                            <div className="flex flex-col">
-                              <span className="font-medium">
-                                {availableDevice.name}{" "}
-                                {/* "(in range)" = an advertisement was actually seen this
-                                    session (positive evidence, needs watchAdvertisements
-                                    support); "(remembered)" = only a permission record from
-                                    a past session - the board may well be asleep or busy. */}
-                                {availableDevice.inRange ? (
-                                  <span className="text-xs text-green-600">(in range)</span>
-                                ) : availableDevice.remembered ? (
-                                  <span className="text-xs text-muted-foreground">(remembered)</span>
-                                ) : null}
-                              </span>
-                              <span className="text-xs text-gray-500">{availableDevice.id}</span>
-                            </div>
-                            {availableDevice.hasTargetService && (
-                              <Badge variant="secondary" className="bg-green-100 text-green-800 border-green-300">
-                                ✅ Compatible
-                              </Badge>
-                            )}
-                          </div>
-                          <Button
-                            size="sm"
-                            onClick={() => connectToSpecificDevice(availableDevice)}
-                            disabled={isConnected}
-                            variant={availableDevice.hasTargetService ? "default" : "outline"}
-                          >
-                            Connect
-                          </Button>
+                    <h3 className="text-sm font-medium">Connected Device:</h3>
+                    <div className="flex items-center justify-between p-3 border rounded-lg">
+                      <div className="flex items-center gap-3">
+                        <div className="flex flex-col">
+                          <span className="font-medium">{connectedDeviceRow.name}</span>
+                          <span className="text-xs text-gray-500">{connectedDeviceRow.id}</span>
                         </div>
-                      ))}
+                        {connectedDeviceRow.hasTargetService && (
+                          <Badge variant="secondary" className="bg-green-100 text-green-800 border-green-300">
+                            ✅ Compatible
+                          </Badge>
+                        )}
+                      </div>
+                      <Button size="sm" variant="outline" disabled>
+                        Connected
+                      </Button>
                     </div>
                   </div>
                 )}

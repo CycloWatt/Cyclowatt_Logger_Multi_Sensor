@@ -4,9 +4,9 @@
  * On this bench a board's name changes all the time: every firmware flash bumps
  * the " v<major.minor.patch>" suffix the firmware appends to its GAP name. The
  * page's device list stores a name snapshot taken when the entry was created (a
- * chooser pick, or a remembered permission grant from getDevices()), so that
- * snapshot goes stale the moment the board is reflashed - and it is exactly the
- * field a bench operator reads to tell boards and builds apart.
+ * chooser pick), so that snapshot goes stale the moment the board is reflashed -
+ * and it is exactly the field a bench operator reads to tell boards and builds
+ * apart.
  *
  * WHAT DOES NOT WORK, because it is the trap this module exists to avoid:
  * re-reading `BluetoothDevice.name`. Chrome caches that property when the device
@@ -18,16 +18,22 @@
  * the build the board used to run.
  *
  * So `device.name` may only ever SEED a brand-new row. Updating an existing row
- * takes one of the two genuinely live sources, both of which arrive through
- * applyDeviceName():
+ * goes through nextDisplayName()/applyDeviceName(), which classify every
+ * candidate by how much it can be trusted:
  *
- *   - "advertisement": BluetoothAdvertisingEvent.name, read per event straight
- *     off the air. Fresh, needs no connection, but a data-acquisition image
- *     truncates its on-air name to 11 characters, so it can be SHORTER than the
- *     truth.
  *   - "gap": the Device Name characteristic (0x2A00) read from the Generic
- *     Access service (0x1800) after connecting. Authoritative and full length -
- *     it is the string the firmware actually set.
+ *     Access service (0x1800) over an open link. Authoritative and full length -
+ *     it is the string the firmware actually set, so it is the only origin
+ *     allowed to SHORTEN the name already on a row.
+ *   - "advertisement": anything less trustworthy than that, and the name says
+ *     where such a candidate used to come from - BluetoothAdvertisingEvent.name,
+ *     read per event off the air by a watchAdvertisements() listener. That
+ *     listener is gone (the page no longer tracks boards it is not connected to),
+ *     and the surviving caller is the scan path's fallback for when the GAP read
+ *     FAILS and only Chrome's cached name is left. The guard both cases need is
+ *     the same one: a data-acquisition image truncates its on-air name to 11
+ *     characters, and Chrome's cache is frozen at grant time, so either can be a
+ *     shorter or staler string than the row already holds.
  */
 
 /**
@@ -76,36 +82,26 @@ export function nextDisplayName(
 }
 
 /**
- * Apply a freshly observed name to the matching row, plus any sibling fields
- * that the same observation proves (the advertisement path also latches
- * `inRange`).
+ * Apply a freshly observed name to the matching row.
  *
  * Identity-preserving at both levels: when nothing changed the SAME array comes
  * back, so a React state setter fed this result bails out of the re-render
  * instead of looping, and untouched rows keep their own object identity so
- * memoized children below them do not re-render either. This matters more than
- * it looks - advertisements repeat several times a second.
+ * memoized children below them do not re-render either.
  */
 export function applyDeviceName<T extends NamedDeviceEntry>(
   entries: T[],
   id: string,
   candidate: string | null | undefined,
   origin: NameOrigin,
-  patch?: Partial<T>,
 ): T[] {
   let changed = false
   const next = entries.map((entry) => {
     if (entry.id !== id) return entry
     const name = nextDisplayName(entry.name, candidate, origin)
-    // A patch field already holding its target value is not a change either,
-    // which is what stops a repeating advertisement from re-rendering the row
-    // once `inRange` is already latched.
-    const patchDiffers = patch
-      ? Object.keys(patch).some((key) => entry[key as keyof T] !== patch[key as keyof T])
-      : false
-    if (name === entry.name && !patchDiffers) return entry
+    if (name === entry.name) return entry
     changed = true
-    return { ...entry, ...patch, name } as T
+    return { ...entry, name }
   })
   return changed ? next : entries
 }
