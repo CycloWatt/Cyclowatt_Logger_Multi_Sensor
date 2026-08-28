@@ -102,16 +102,44 @@ ${colorConfig
 
 const ChartTooltip = RechartsPrimitive.Tooltip
 
+// The props recharts' Tooltip injects when it clones the content element,
+// typed locally. Recharts 3 no longer carries them on the Tooltip component's
+// own props, and its TooltipContentProps declares them all REQUIRED - which
+// would reject the `content={<ChartTooltipContent />}` usage, where they only
+// arrive later via cloneElement.
+type TooltipItem = {
+  dataKey?: string | number
+  name?: React.ReactNode
+  value?: number | string
+  color?: string
+  payload?: { fill?: string } & Record<string, unknown>
+}
+
 const ChartTooltipContent = React.forwardRef<
   HTMLDivElement,
-  React.ComponentProps<typeof RechartsPrimitive.Tooltip> &
-    React.ComponentProps<'div'> & {
-      hideLabel?: boolean
-      hideIndicator?: boolean
-      indicator?: 'line' | 'dot' | 'dashed'
-      nameKey?: string
-      labelKey?: string
-    }
+  React.ComponentProps<'div'> & {
+    active?: boolean
+    payload?: ReadonlyArray<TooltipItem>
+    label?: React.ReactNode
+    labelFormatter?: (
+      label: React.ReactNode,
+      payload: ReadonlyArray<TooltipItem>,
+    ) => React.ReactNode
+    labelClassName?: string
+    formatter?: (
+      value: number | string,
+      name: React.ReactNode,
+      item: TooltipItem,
+      index: number,
+      payload: TooltipItem['payload'],
+    ) => React.ReactNode
+    color?: string
+    hideLabel?: boolean
+    hideIndicator?: boolean
+    indicator?: 'line' | 'dot' | 'dashed'
+    nameKey?: string
+    labelKey?: string
+  }
 >(
   (
     {
@@ -188,7 +216,7 @@ const ChartTooltipContent = React.forwardRef<
           {payload.map((item, index) => {
             const key = `${nameKey || item.name || item.dataKey || 'value'}`
             const itemConfig = getPayloadConfigFromPayload(config, item, key)
-            const indicatorColor = color || item.payload.fill || item.color
+            const indicatorColor = color || item.payload?.fill || item.color
 
             return (
               <div
@@ -260,11 +288,14 @@ const ChartLegend = RechartsPrimitive.Legend
 
 const ChartLegendContent = React.forwardRef<
   HTMLDivElement,
-  React.ComponentProps<'div'> &
-    Pick<RechartsPrimitive.LegendProps, 'payload' | 'verticalAlign'> & {
-      hideIcon?: boolean
-      nameKey?: string
-    }
+  React.ComponentProps<'div'> & {
+    // Injected by recharts' Legend on cloneElement - same story as the
+    // tooltip's props above, but the payload entry type IS still exported.
+    payload?: ReadonlyArray<RechartsPrimitive.LegendPayload>
+    verticalAlign?: 'top' | 'middle' | 'bottom'
+    hideIcon?: boolean
+    nameKey?: string
+  }
 >(
   (
     { className, hideIcon = false, payload, verticalAlign = 'bottom', nameKey },
