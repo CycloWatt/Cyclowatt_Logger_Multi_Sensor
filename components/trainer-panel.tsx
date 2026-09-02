@@ -51,7 +51,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { TrainerChart, type TrainerChartPoint } from "@/components/trainer-chart"
-import { TrainerManualControls, type ManualSubMode } from "@/components/trainer-manual-controls"
+import { TrainerManualControls } from "@/components/trainer-manual-controls"
 import { TrainerReadouts } from "@/components/trainer-readouts"
 import { TrainerStepEditor } from "@/components/trainer-step-editor"
 import { BOARD_NAME_PREFIXES, isBoardName } from "@/lib/device-name"
@@ -88,6 +88,7 @@ import {
   type SessionLog,
   type TrainerMode,
 } from "@/lib/trainer/session-log"
+import { manualModeFor, subModeFor, type ManualSubMode } from "@/lib/trainer/mode"
 
 export interface TrainerPanelProps {
   /** bluetoothSupported && isSecureContext, from the page. */
@@ -793,7 +794,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   }
 
   function handleSubModeChange(subMode: ManualSubMode): void {
-    changeMode(subMode === "power" ? "manual-power" : "manual-resistance")
+    changeMode(manualModeFor(subMode))
   }
 
   /**
@@ -1218,7 +1219,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         </>
       ) : (
         <TrainerManualControls
-          subMode={mode === "manual-resistance" ? "resistance" : "power"}
+          subMode={subModeFor(mode)}
           onSubModeChange={handleSubModeChange}
           targetW={manualTargetW}
           onTargetW={handleManualTargetW}

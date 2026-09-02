@@ -24,8 +24,9 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Slider } from "@/components/ui/slider"
 import { clampToRange, type SupportedRange } from "@/lib/ftms/protocol"
+import type { ManualSubMode } from "@/lib/trainer/mode"
 
-export type ManualSubMode = "power" | "resistance"
+export type { ManualSubMode } from "@/lib/trainer/mode"
 
 export interface TrainerManualControlsProps {
   subMode: ManualSubMode
