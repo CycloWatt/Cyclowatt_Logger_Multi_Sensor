@@ -5,10 +5,13 @@
  * ERG step protocols, manual target power, manual resistance - while recording
  * one CSV that lines up with the Python logger's own capture.
  *
- * This component owns ALL trainer state; app/page.tsx only mounts it. The four
- * leaf components below it are purely presentational and every byte-level or
- * timing decision lives in lib/ftms/ and lib/trainer/, so what is left here is
- * the wiring - and four decisions worth explaining:
+ * app/page.tsx only mounts this component. The four leaf components below it
+ * are purely presentational, every byte-level or timing decision lives in
+ * lib/ftms/ and lib/trainer/, and the ORCHESTRATION - what to send the trainer,
+ * in what order, and what to write in the session log - lives in
+ * TrainerController (lib/trainer/controller.ts), which this component mirrors
+ * into one piece of state. So what is left here is the wiring - and four
+ * decisions worth explaining:
  *
  * WHY ITS OWN CHOOSER. Chrome binds the set of reachable GATT services to the
  * grant made at requestDevice() time, so a device picked in the board chooser
@@ -40,9 +43,11 @@
  * one click anyway. See lib/trainer/session-log.ts.
  *
  * ONE DISCIPLINE TO KEEP: everything on the notification path (handleBikeData ->
- * tickRunner -> applyEvents -> sendControl -> logEvent) reads REFS, never state.
- * Those closures are captured once, at connect time, and a state variable read
- * there would be frozen at whatever it was when the trainer was connected.
+ * controller.tick -> the plan interpreter -> sendControl -> logEvent) reads the
+ * controller's live fields (through `controller.snapshot`, rebuilt on every
+ * change) or a ref - never this render's state. Those closures are captured
+ * once, at connect time, and a state variable read there would be frozen at
+ * whatever it was when the trainer was connected.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react"
@@ -55,40 +60,29 @@ import { TrainerManualControls } from "@/components/trainer-manual-controls"
 import { TrainerReadouts } from "@/components/trainer-readouts"
 import { TrainerStepEditor } from "@/components/trainer-step-editor"
 import { BOARD_NAME_PREFIXES, isBoardName } from "@/lib/device-name"
-import { FtmsControlError, openFtmsSession, type FtmsCapabilities, type FtmsSession } from "@/lib/ftms/control"
+import { openFtmsSession } from "@/lib/ftms/control"
 import type { IndoorBikeData } from "@/lib/ftms/indoor-bike-data"
 import {
   DEFAULT_POWER_RANGE,
   DEFAULT_RESISTANCE_RANGE,
   FTMS_OPTIONAL_SERVICES,
-  FTMS_RESULT,
   FTMS_SERVICE_UUID,
   type FtmsStatus,
 } from "@/lib/ftms/protocol"
 import { appendChartPoint, type TrainerChartPoint } from "@/lib/trainer/chart-buffer"
-import { planRunnerEffects, type PlannedOp } from "@/lib/trainer/control-plan"
+import { TrainerController } from "@/lib/trainer/controller"
 import { createThrottle } from "@/lib/trainer/display-throttle"
 import { elapsedLabel, isStale, stepLabel, targetLabel } from "@/lib/trainer/labels"
 import { logProtocolName, logStepIndex } from "@/lib/trainer/log-context"
 import { deletePreset, readPresets, savePreset, validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
-import { liveTargetW, protocolTargetW, resistanceTenthsFromPct } from "@/lib/trainer/targets"
-import {
-  createRunner,
-  protocolDurationSeconds,
-  reduceRunner,
-  runnerView,
-  type ProtocolStep,
-  type RunnerEvent,
-  type RunnerState,
-} from "@/lib/trainer/protocol-runner"
+import { liveTargetW, protocolTargetW } from "@/lib/trainer/targets"
+import { protocolDurationSeconds, runnerView, type ProtocolStep } from "@/lib/trainer/protocol-runner"
 import {
   appendEvent,
   appendSample,
   createSessionLog,
   sessionLogFilename,
   sessionLogToCsv,
-  type LogEventKind,
-  type SessionLog,
   type TrainerMode,
 } from "@/lib/trainer/session-log"
 import { manualModeFor, subModeFor, type ManualSubMode } from "@/lib/trainer/mode"
@@ -131,15 +125,57 @@ function useLatestRef<T>(value: T) {
 }
 
 export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanelProps) {
-  const [device, setDevice] = useState<BluetoothDevice | null>(null)
-  const [deviceName, setDeviceName] = useState("")
-  const [connecting, setConnecting] = useState(false)
-  const [connected, setConnected] = useState(false)
-  const [capabilities, setCapabilities] = useState<FtmsCapabilities | null>(null)
-  const [hasControl, setHasControl] = useState(false)
-  const [error, setError] = useState("")
+  const boardDeviceIdRef = useLatestRef(boardDeviceId)
+  /*
+   * The one collaborator that is not React. Created lazily in a ref so its
+   * injected closures are built exactly once and outlive every render; none of
+   * them touches `navigator` until it is called, so the static export can still
+   * prerender this page in node.
+   */
+  const controllerRef = useRef<TrainerController | null>(null)
+  if (controllerRef.current === null) {
+    controllerRef.current = new TrainerController({
+      openSession: openFtmsSession,
+      requestDevice: (options) => navigator.bluetooth.requestDevice(options),
+      boardDeviceId: () => boardDeviceIdRef.current,
+      now: () => Date.now(),
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle as Parameters<typeof clearTimeout>[0]),
+      log: console,
+    })
+  }
+  const controller = controllerRef.current
 
-  const sessionRef = useRef<FtmsSession | null>(null)
+  /*
+   * ONE state variable for everything the controller owns: it rebuilds a whole
+   * snapshot object on every change, so a single setState is both the cheapest
+   * and the most honest mirror of it. Subscribed in an effect - never during
+   * render - and re-read once on subscribe, in case a change landed between
+   * this render and the effect.
+   */
+  const [snapshot, setSnapshot] = useState(() => controller.snapshot)
+  useEffect(() => {
+    const unsubscribe = controller.subscribe(() => setSnapshot(controller.snapshot))
+    setSnapshot(controller.snapshot)
+    return unsubscribe
+  }, [controller])
+  const {
+    capabilities,
+    connected,
+    deviceName,
+    error,
+    hasControl,
+    manualTargetSent,
+    mode,
+    protocolName,
+    runner,
+    starting,
+    steps,
+  } = snapshot
+
+  const [device, setDevice] = useState<BluetoothDevice | null>(null)
+  const [connecting, setConnecting] = useState(false)
+
   /**
    * The device the `gattserverdisconnected` listener is attached to.
    *
@@ -148,38 +184,13 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
    * and a `[]`-dep effect cannot see the `device` state. Hence the mirror.
    */
   const deviceRef = useRef<BluetoothDevice | null>(null)
-  /** Has Start or Resume (0x07) been sent since control was acquired? The Kickr honours ERG targets only after it. */
-  const startedRef = useRef(false)
-  const hasControlRef = useRef(false)
 
-  const [mode, setMode] = useState<TrainerMode>("protocol")
   const [manualTargetW, setManualTargetW] = useState(100)
   const [manualResistancePct, setManualResistancePct] = useState(20)
-  /**
-   * Which manual target has actually been WRITTEN since the last mode change,
-   * or null for none.
-   *
-   * Without this the readout and every recorded sample switch to the new mode's
-   * target the instant a mode button is clicked, while the trainer still holds
-   * the old one - so the CSV's target columns would describe a target that was
-   * never on the wire. Cleared on every mode change and on every disconnect;
-   * state (for the label) mirrored into a ref (for the notification path).
-   */
-  const [manualTargetSent, setManualTargetSent] = useState<ManualSubMode | null>(null)
-  const manualTargetSentRef = useRef<ManualSubMode | null>(null)
 
-  const [runner, setRunner] = useState<RunnerState>(() => createRunner({ name: "", steps: [] }))
-  const runnerRef = useRef(runner)
-  /** True across startProtocol's awaits, so a double click cannot mint two runners. */
-  const [starting, setStarting] = useState(false)
-  const startingRef = useRef(false)
-
-  const [steps, setSteps] = useState<ProtocolStep[]>([{ targetWatts: 150, durationSeconds: 300 }])
-  const [protocolName, setProtocolName] = useState("")
   const [presets, setPresets] = useState<TrainerPreset[]>([])
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null)
 
-  const logRef = useRef<SessionLog | null>(null)
   const [recording, setRecording] = useState(false)
   const [sampleCount, setSampleCount] = useState(0)
 
@@ -194,228 +205,9 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   /** Re-render clock, so `stale` and the elapsed labels move on their own. */
   const [nowTick, setNowTick] = useState(() => 0)
 
-  const modeRef = useLatestRef(mode)
   const recordingRef = useLatestRef(recording)
-  const protocolNameRef = useLatestRef(protocolName)
   const manualTargetWRef = useLatestRef(manualTargetW)
   const manualResistancePctRef = useLatestRef(manualResistancePct)
-
-  /* ---------------------------------------------------------------- logging */
-
-  /**
-   * Append one event row, if there is a log to append it to.
-   *
-   * Gated on the log EXISTING rather than on `recording`: a log outlives Stop
-   * recording (until Clear or a new session), and a disconnect or a refused
-   * control op after the samples stop is still worth a row in the file.
-   */
-  function logEvent(event: LogEventKind, detail: string, atMs: number = Date.now()): void {
-    const log = logRef.current
-    if (!log) return
-    appendEvent(log, {
-      epochMs: atMs,
-      elapsedS: (atMs - log.startedAtMs) / 1000,
-      mode: modeRef.current,
-      protocolName: logProtocolName(modeRef.current, protocolNameRef.current),
-      stepIndex: logStepIndex(modeRef.current, runnerRef.current),
-      event,
-      detail,
-    })
-  }
-
-  /* ------------------------------------------------------- control-point ops */
-
-  function markControl(value: boolean): void {
-    hasControlRef.current = value
-    setHasControl(value)
-  }
-
-  /** See manualTargetSent: ref for the notification path, state for the readout. */
-  function markManualTargetSent(value: ManualSubMode | null): void {
-    manualTargetSentRef.current = value
-    setManualTargetSent(value)
-  }
-
-  /**
-   * Run one Control Point procedure, log the outcome, and never throw.
-   *
-   * CONTROL_NOT_PERMITTED gets exactly one retry behind a fresh Request Control:
-   * the trainer drops control silently (another app took it, or it power-cycled
-   * the link), and re-taking it is the documented cure. Every other failure is
-   * logged and surfaced but SWALLOWED - a target that did not land must not tear
-   * down the runner mid-protocol, leaving the rider with no target at all.
-   *
-   * @param options.restartAfterRetake pass false for the 0x08 ops (Stop, Pause):
-   * re-starting the trainer only to stop it again is self-contradictory, and it
-   * would leave startedRef claiming a started trainer that the op then un-starts.
-   * @returns true when the trainer acknowledged (first try or retry).
-   */
-  async function sendControl(
-    label: string,
-    run: () => Promise<void>,
-    options: { restartAfterRetake?: boolean } = {},
-  ): Promise<boolean> {
-    const session = sessionRef.current
-    if (!session) return false
-    try {
-      await run()
-      logEvent("control-result", `${label} -> success`)
-      return true
-    } catch (err) {
-      if (err instanceof FtmsControlError && err.resultCode === FTMS_RESULT.CONTROL_NOT_PERMITTED) {
-        try {
-          await session.requestControl()
-          markControl(true)
-          /*
-           * Re-taking control is not enough. Control that was revoked and
-           * re-granted leaves the trainer NOT in the started state, so a target
-           * written straight after the Request Control is ACKNOWLEDGED and then
-           * ignored - and the log would say "success after re-taking control"
-           * about a target that never reached the flywheel. 0x07 first.
-           */
-          const restart = options.restartAfterRetake !== false
-          if (restart) {
-            startedRef.current = false
-            await session.start()
-            startedRef.current = true
-          }
-          await run()
-          logEvent(
-            "control-result",
-            `${label} -> success after re-taking control${restart ? " and re-starting" : ""}`,
-          )
-          return true
-        } catch (retryErr) {
-          markControl(false)
-          // The trainer's state is now unknown - the Request Control, the 0x07 or
-          // the op itself failed - so claim nothing about it having been started.
-          startedRef.current = false
-          logEvent("control-result", `${label} -> failed after re-taking control: ${errorText(retryErr)}`)
-          setError(`${label} failed: ${errorText(retryErr)}`)
-          return false
-        }
-      }
-      logEvent("control-result", `${label} -> failed: ${errorText(err)}`)
-      setError(`${label} failed: ${errorText(err)}`)
-      return false
-    }
-  }
-
-  /** Control taken and 0x07 sent - the two preconditions for any target to be honoured. */
-  async function ensureStarted(): Promise<boolean> {
-    const session = sessionRef.current
-    if (!session) return false
-    if (!hasControlRef.current) {
-      if (!(await sendControl("Request Control", () => session.requestControl()))) return false
-      markControl(true)
-    }
-    if (!startedRef.current) {
-      if (!(await sendControl("Start or Resume", () => session.start()))) return false
-      startedRef.current = true
-    }
-    return true
-  }
-
-  async function takeControl(): Promise<void> {
-    const session = sessionRef.current
-    if (!session) return
-    setError("")
-    if (await sendControl("Request Control", () => session.requestControl())) markControl(true)
-  }
-
-  /* -------------------------------------------------------- runner plumbing */
-
-  function commitRunner(state: RunnerState): void {
-    runnerRef.current = state
-    setRunner(state)
-  }
-
-  /**
-   * Log every runner event, and (unless `send` is false) put the trainer where
-   * the runner now says it should be.
-   *
-   * `send: false` is for the two cases where the runner moves BECAUSE the link
-   * is gone - a disconnect or a revoked control - and a write would only queue
-   * up behind a dead Control Point.
-   *
-   * Every DECISION here - which rows, which opcodes, in which order, under
-   * which labels, and how `startedRef` moves - lives in planRunnerEffects
-   * (lib/trainer/control-plan.ts), behind an exhaustive unit test. What is
-   * left below is the interpreter that puts that plan on the wire.
-   */
-  function applyEvents(events: RunnerEvent[], nowMs: number, options: { send?: boolean } = {}): void {
-    const session = sessionRef.current
-    const started = startedRef.current
-    const plan = planRunnerEffects({
-      events,
-      started,
-      powerRange: session?.capabilities.powerRange ?? DEFAULT_POWER_RANGE,
-      runnerStatusAfter: runnerRef.current.status,
-      send: options.send !== false && session !== null,
-    })
-
-    // Rows first, in event order - and written even when nothing is sent.
-    for (const row of plan.rows) logEvent(row.event, row.detail, nowMs)
-
-    if (!session || plan.ops.length === 0) return
-
-    /*
-     * Stop's 0x08 puts the trainer back in the state where it honours no ERG
-     * target, so the next run has to send 0x07 again (see ensureStarted). Set
-     * NOW, before any await: a fast Start click must not find a stale `true`
-     * while these writes are still queued. Only ever a clear - the plan never
-     * claims a trainer started that the ops below have not started.
-     */
-    if (plan.startedBeforeOps !== started) startedRef.current = plan.startedBeforeOps
-
-    /** One planned op on the wire. Its label is the `control-result` row it logs. */
-    const issue = (op: PlannedOp): Promise<boolean> => {
-      switch (op.kind) {
-        case "start":
-          return sendControl(op.label, () => session.start())
-        case "targetPower":
-          return sendControl(op.label, () => session.setTargetPower(op.watts))
-        case "stop":
-          return sendControl(op.label, () => session.stop(), { restartAfterRetake: false })
-        case "pause":
-          return sendControl(op.label, () => session.pause(), { restartAfterRetake: false })
-      }
-    }
-
-    if (plan.sequencing === "chain") {
-      // The protocol-end ops, serialised in one async run rather than fired as
-      // independent calls, so the order on the wire is 0x07 -> target -> 0x08
-      // whatever the queue does - and a failed 0x07 abandons the rest.
-      void (async () => {
-        for (const op of plan.ops) {
-          const acknowledged = await issue(op)
-          if (op.kind !== "start") continue
-          if (!acknowledged) {
-            if (plan.abortChainOnStartFailure) return
-            continue
-          }
-          if (op.markStartedOnSuccess) startedRef.current = true
-        }
-      })()
-      return
-    }
-
-    // A step target and a Pause are each fired without awaiting the other one.
-    for (const op of plan.ops) {
-      void issue(op)
-      if (op.kind === "pause") startedRef.current = false // as for Stop above: Resume must re-send 0x07.
-    }
-  }
-
-  function tickRunner(nowMs: number): void {
-    const previous = runnerRef.current
-    const { state, events } = reduceRunner(previous, { type: "tick" }, nowMs)
-    // reduceRunner hands back the SAME reference for a no-op, which is most
-    // ticks - so this is the check that keeps a 4 Hz interval from re-rendering.
-    if (state === previous) return
-    commitRunner(state)
-    applyEvents(events, nowMs)
-  }
 
   /* ------------------------------------------------------ display throttling */
 
@@ -423,7 +215,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     setLive(liveRef.current)
     // A NEW array every flush: TrainerChart is memo'd and compares identity.
     setChartData([...chartBufferRef.current])
-    setSampleCount(logRef.current?.samples.length ?? 0)
+    setSampleCount(controller._task8Log?.samples.length ?? 0)
     setNowTick(Date.now())
   }
 
@@ -445,103 +237,90 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
   /* -------------------------------------------------------- session handlers */
 
-  const handleBikeData = useCallback((data: IndoorBikeData, nowMs: number) => {
-    liveRef.current = {
-      powerW: data.powerW,
-      cadenceRpm: data.cadenceRpm,
-      speedKmh: data.speedKmh,
-      hrBpm: data.heartRateBpm,
-      receivedAtMs: nowMs,
-    }
-
-    if (chartStartMsRef.current === null) chartStartMsRef.current = nowMs
-    const currentMode = modeRef.current
-    // manual-power only counts once its target has actually been written - see
-    // manualTargetSent. Until then this row records no target, because there
-    // isn't one this panel put on the wire.
-    const targetW =
-      currentMode === "protocol"
-        ? protocolTargetW(runnerRef.current, nowMs)
-        : currentMode === "manual-power" && manualTargetSentRef.current === "power"
-          ? manualTargetWRef.current
-          : null
-
-    appendChartPoint(chartBufferRef.current, {
-      t: (nowMs - chartStartMsRef.current) / 1000,
-      power: data.powerW,
-      target: targetW,
-      cadence: data.cadenceRpm,
-    })
-
-    const log = logRef.current
-    if (recordingRef.current && log) {
-      appendSample(log, {
-        epochMs: nowMs,
-        elapsedS: (nowMs - log.startedAtMs) / 1000,
-        mode: currentMode,
-        protocolName: logProtocolName(currentMode, protocolNameRef.current),
-        stepIndex: logStepIndex(currentMode, runnerRef.current),
-        stepTargetW: targetW,
-        targetResistancePct:
-          currentMode === "manual-resistance" && manualTargetSentRef.current === "resistance"
-            ? manualResistancePctRef.current
-            : null,
+  const handleBikeData = useCallback(
+    (data: IndoorBikeData, nowMs: number) => {
+      liveRef.current = {
         powerW: data.powerW,
         cadenceRpm: data.cadenceRpm,
         speedKmh: data.speedKmh,
         hrBpm: data.heartRateBpm,
+        receivedAtMs: nowMs,
+      }
+
+      if (chartStartMsRef.current === null) chartStartMsRef.current = nowMs
+      /*
+       * The controller's OWN snapshot, not this render's: it is rebuilt on every
+       * change, so reading it here reads the newest mode, runner and
+       * manual-target flag - the ONE DISCIPLINE note, now a property of the
+       * class. Read before the tick below, exactly as the refs were.
+       */
+      const current = controller.snapshot
+      const currentMode = current.mode
+      // manual-power only counts once its target has actually been written - see
+      // manualTargetSent. Until then this row records no target, because there
+      // isn't one this panel put on the wire.
+      const targetW =
+        currentMode === "protocol"
+          ? protocolTargetW(current.runner, nowMs)
+          : currentMode === "manual-power" && current.manualTargetSent === "power"
+            ? manualTargetWRef.current
+            : null
+
+      appendChartPoint(chartBufferRef.current, {
+        t: (nowMs - chartStartMsRef.current) / 1000,
+        power: data.powerW,
+        target: targetW,
+        cadence: data.cadenceRpm,
       })
-      // sampleCount is refreshed from the log on the throttled flush, not here:
-      // one setState per notification is exactly what the throttle exists to avoid.
-    }
 
-    tickRunner(nowMs)
-    queueDisplayUpdate()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- reads refs only; see the module comment.
-  }, [])
+      const log = controller._task8Log
+      if (recordingRef.current && log) {
+        appendSample(log, {
+          epochMs: nowMs,
+          elapsedS: (nowMs - log.startedAtMs) / 1000,
+          mode: currentMode,
+          protocolName: logProtocolName(currentMode, current.protocolName),
+          stepIndex: logStepIndex(currentMode, current.runner),
+          stepTargetW: targetW,
+          targetResistancePct:
+            currentMode === "manual-resistance" && current.manualTargetSent === "resistance"
+              ? manualResistancePctRef.current
+              : null,
+          powerW: data.powerW,
+          cadenceRpm: data.cadenceRpm,
+          speedKmh: data.speedKmh,
+          hrBpm: data.heartRateBpm,
+        })
+        // sampleCount is refreshed from the log on the throttled flush, not here:
+        // one setState per notification is exactly what the throttle exists to avoid.
+      }
 
-  const handleStatus = useCallback((status: FtmsStatus) => {
-    logEvent("status", JSON.stringify(status))
-    if (status.kind === "targetPowerChanged") setTrainerReportedTargetW(status.watts)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+      controller.tick(nowMs)
+      queueDisplayUpdate()
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- reads refs and the controller's live snapshot; see the module comment.
+    },
+    [controller],
+  )
 
-  const handleControlLost = useCallback(() => {
-    markControl(false)
-    startedRef.current = false
-    // Whatever manual target we set is no longer ours to claim - the trainer is
-    // taking someone else's now.
-    markManualTargetSent(null)
-    logEvent("control-lost", "the trainer revoked control")
-    const nowMs = Date.now()
-    if (runnerRef.current.status === "running") {
-      const { state, events } = reduceRunner(runnerRef.current, { type: "pause" }, nowMs)
-      commitRunner(state)
-      applyEvents(events, nowMs, { send: false })
-    }
-    setError("The trainer revoked control (another app took it). Press Take Control to continue.")
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  const handleStatus = useCallback(
+    (status: FtmsStatus) => {
+      controller.logEvent("status", JSON.stringify(status))
+      if (status.kind === "targetPowerChanged") setTrainerReportedTargetW(status.watts)
+    },
+    [controller],
+  )
+
+  const handleControlLost = useCallback(() => controller.onControlLost(), [controller])
 
   function handleDisconnected(): void {
-    void sessionRef.current?.dispose()
-    sessionRef.current = null
-    setConnected(false)
-    markControl(false)
-    startedRef.current = false
-    // A dropped link holds no target of ours any more, so the readout must stop
-    // claiming one until something has actually been re-sent.
-    markManualTargetSent(null)
-
+    // Everything about the session and the flags that describe a live link is
+    // the controller's; the pause is deliberately send-less (no BLE write can
+    // land on a link that just went away) and the protocol is paused rather
+    // than stopped, because it is recoverable.
+    controller.detachSession()
     const nowMs = Date.now()
-    if (runnerRef.current.status === "running") {
-      // Pause rather than stop: the protocol is recoverable, and no BLE write can
-      // land on a link that just went away.
-      const { state, events } = reduceRunner(runnerRef.current, { type: "pause" }, nowMs)
-      commitRunner(state)
-      applyEvents(events, nowMs, { send: false })
-    }
-    logEvent("disconnected", "link lost", nowMs)
+    controller.pauseWithoutSending(nowMs)
+    controller.logEvent("disconnected", "link lost", nowMs)
     // `device`, the log and the chart are all kept, so Reconnect and Export still work.
   }
 
@@ -560,51 +339,36 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       onStatus: handleStatus,
       onControlLost: handleControlLost,
     })
-    sessionRef.current = session
-    setCapabilities(session.capabilities)
     setDevice(target)
-    setDeviceName(target.name || "Trainer")
-    setConnected(true)
-    startedRef.current = false
-    markControl(false)
-    markManualTargetSent(null)
     setTrainerReportedTargetW(null)
-
-    // One line per connect, so the PR's hardware checklist can be filled in from
-    // the console rather than from a screenshot of the badges. The raw feature
-    // words are the part worth having verbatim: a bit this panel does not read
-    // yet is still visible in them.
-    const caps = session.capabilities
-    console.log("Trainer capabilities", {
-      features: caps.features,
-      rawFeatureWords: caps.features
-        ? `machine=0x${caps.features.raw.machine.toString(16).padStart(8, "0")} ` +
-          `targetSetting=0x${caps.features.raw.targetSetting.toString(16).padStart(8, "0")}`
-        : "unknown - the trainer did not publish 0x2ACC",
-      powerRange: caps.powerRange,
-      resistanceRange: caps.resistanceRange,
-      resistanceWireCeilingTenths: Math.min(caps.resistanceRange.max, 0xff),
-    })
 
     // Remove first: a reconnect on the same device would otherwise stack a second
     // listener, and every later drop would run the handler twice.
     target.removeEventListener("gattserverdisconnected", onGattDisconnected)
     target.addEventListener("gattserverdisconnected", onGattDisconnected)
     deviceRef.current = target
-    logEvent("connected", target.name || "Trainer")
 
-    if (await sendControl("Request Control", () => session.requestControl())) markControl(true)
+    /*
+     * Everything else this function used to do - the session, the capabilities,
+     * the deviceName, `connected`, the started/control/manual-target clears, the
+     * one-line capability dump, the `connected` row and the opening Request
+     * Control - is attachSession's, in that same order. The listener is wired
+     * just ahead of it (rather than in the middle, where the console line used
+     * to sit) so that it is already attached across the Request Control's round
+     * trip; no log row and no write moves.
+     */
+    await controller.attachSession(session, target.name || "Trainer")
   }
 
   async function connectTrainer(): Promise<void> {
     const ble = navigator.bluetooth
     if (!ble) {
-      setError("Web Bluetooth API is not supported in this browser.")
+      controller.setError("Web Bluetooth API is not supported in this browser.")
       return
     }
 
     setConnecting(true)
-    setError("")
+    controller.setError("")
     try {
       const requestOptions: RequestDeviceOptions = {
         filters: [{ services: [FTMS_SERVICE_UUID] }],
@@ -630,7 +394,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       // ours. The id check catches the same board under a name the prefix list
       // does not know.
       if (isBoardName(candidate.name) || (candidate.id && candidate.id === boardDeviceId)) {
-        setError(
+        controller.setError(
           `${candidate.name || "That device"} is a CycloWatt board, not a trainer. ` +
             "Pick the Kickr (or another FTMS trainer) here - a CycloWatt board connects " +
             "with the sensor connection on the Data Streaming tab.",
@@ -642,7 +406,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       await openSession(candidate)
     } catch (err) {
       console.error("Trainer connection failed:", err)
-      setError(`Trainer connection failed: ${errorText(err)}`)
+      controller.setError(`Trainer connection failed: ${errorText(err)}`)
     } finally {
       setConnecting(false)
     }
@@ -652,29 +416,16 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   async function reconnectTrainer(): Promise<void> {
     if (!device) return
     setConnecting(true)
-    setError("")
+    controller.setError("")
     try {
       await openSession(device)
-      const session = sessionRef.current
-      if (!session) return
       // Put the trainer back where the panel thinks it is: a re-opened link has
       // forgotten every target, and 0x07 has to precede them all (ensureStarted).
-      const state = runnerRef.current
-      const target = mode === "protocol" ? protocolTargetW(state, Date.now()) : null
-      if (target !== null) {
-        if (!(await ensureStarted())) return
-        const watts = target
-        if (await sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))) {
-          logEvent("target-set", `${watts} W (re-sent after reconnect)`)
-        }
-      } else if (mode === "manual-power") {
-        await sendManualPower(manualTargetW)
-      } else if (mode === "manual-resistance") {
-        await sendManualResistance(manualResistancePct)
-      }
+      // The two manual values are still this component's, hence the arguments.
+      await controller.restoreTargetAfterReconnect(manualTargetW, manualResistancePct)
     } catch (err) {
       console.error("Trainer reconnect failed:", err)
-      setError(`Trainer reconnect failed: ${errorText(err)}`)
+      controller.setError(`Trainer reconnect failed: ${errorText(err)}`)
     } finally {
       setConnecting(false)
     }
@@ -684,8 +435,8 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     const target = device ?? deviceRef.current
     target?.removeEventListener("gattserverdisconnected", onGattDisconnected)
     deviceRef.current = null
-    await sessionRef.current?.dispose()
-    sessionRef.current = null
+    // Awaited, so the unsubscribe finishes before the link is dropped.
+    await controller.disposeSession()
     try {
       if (target?.gatt?.connected) target.gatt.disconnect()
     } catch (err) {
@@ -697,45 +448,17 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     // running with no session keeps ticking step boundaries and logging
     // step-started rows for targets nothing can receive. No BLE sends - the
     // session is already disposed.
-    if (runnerRef.current.status === "running") {
-      const { state, events } = reduceRunner(runnerRef.current, { type: "pause" }, nowMs)
-      commitRunner(state)
-      applyEvents(events, nowMs, { send: false })
-    }
+    controller.pauseWithoutSending(nowMs)
 
-    logEvent("disconnected", "disconnected by the operator", nowMs)
-    setConnected(false)
-    markControl(false)
-    startedRef.current = false
-    markManualTargetSent(null)
+    controller.logEvent("disconnected", "disconnected by the operator", nowMs)
+    // The row above is written while `connected` is still true, as it was when
+    // these were separate setStates - hence the clearing afterwards.
+    controller.clearConnection()
     setDevice(null)
-    setDeviceName("")
-    setCapabilities(null)
     setTrainerReportedTargetW(null)
   }
 
   /* ----------------------------------------------------------------- manual */
-
-  async function sendManualPower(watts: number): Promise<void> {
-    const session = sessionRef.current
-    if (!session) return
-    if (!(await ensureStarted())) return
-    if (await sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))) {
-      logEvent("target-set", `${watts} W (manual)`)
-      markManualTargetSent("power")
-    }
-  }
-
-  async function sendManualResistance(pct: number): Promise<void> {
-    const session = sessionRef.current
-    if (!session) return
-    if (!(await ensureStarted())) return
-    const tenths = resistanceTenthsFromPct(pct, session.capabilities.resistanceRange)
-    if (await sendControl(`Set Target Resistance ${tenths / 10}`, () => session.setTargetResistance(tenths))) {
-      logEvent("target-set", `${pct} % -> ${tenths / 10} resistance level (manual)`)
-      markManualTargetSent("resistance")
-    }
-  }
 
   /**
    * Coalesce a burst of manual edits into one write.
@@ -754,12 +477,12 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
   function handleManualTargetW(watts: number): void {
     setManualTargetW(watts)
-    if (connected && mode === "manual-power") queueManualSend(() => sendManualPower(watts))
+    if (connected && mode === "manual-power") queueManualSend(() => controller.sendManualPower(watts))
   }
 
   function handleManualResistancePct(pct: number): void {
     setManualResistancePct(pct)
-    if (connected && mode === "manual-resistance") queueManualSend(() => sendManualResistance(pct))
+    if (connected && mode === "manual-resistance") queueManualSend(() => controller.sendManualResistance(pct))
   }
 
   function handleSubModeChange(subMode: ManualSubMode): void {
@@ -787,77 +510,26 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       clearTimeout(manualTimerRef.current)
       manualTimerRef.current = null
     }
-    markManualTargetSent(null)
-    setMode(next)
-    // Written straight away, not left to useLatestRef's effect: the very next
-    // notification must record the mode the operator just chose.
-    modeRef.current = next
+    controller.markManualTargetSent(null)
+    // The controller's field is written straight away, so the very next
+    // notification records the mode the operator just chose - what modeRef did.
+    controller._task8SetMode(next)
 
     if (!connected) return // nothing to sync, and the null flag keeps the readout at "–"
-    if (next === "manual-power") void sendManualPower(manualTargetW)
-    else if (next === "manual-resistance") void sendManualResistance(manualResistancePct)
-  }
-
-  /* --------------------------------------------------------- run  controls */
-
-  /**
-   * Load the edited steps into a fresh runner and start it.
-   *
-   * Re-entrancy matters here: ensureStarted awaits up to two Control Point round
-   * trips (5 s each in the worst case) while the runner is still `idle`, so the
-   * Start button's own `disabled` cannot cover the gap - a second click would
-   * mint a SECOND runner over the first and leave two `start` reductions racing.
-   * The ref is what actually holds the door, since two clicks in one tick would
-   * both see `starting` false.
-   */
-  async function startProtocol(): Promise<void> {
-    if (startingRef.current) return
-    const problem = validateSteps(steps)
-    if (problem !== null) {
-      setError(`Cannot start the protocol: ${problem}.`)
-      return
-    }
-    setError("")
-    startingRef.current = true
-    setStarting(true)
-    try {
-      const fresh = createRunner({ name: protocolName.trim() || "Protocol", steps })
-      commitRunner(fresh)
-      if (!(await ensureStarted())) return
-      const nowMs = Date.now()
-      const { state, events } = reduceRunner(fresh, { type: "start" }, nowMs)
-      commitRunner(state)
-      applyEvents(events, nowMs)
-    } finally {
-      startingRef.current = false
-      setStarting(false)
-    }
-  }
-
-  function dispatchRunner(action: "pause" | "resume" | "skip" | "stop"): void {
-    const nowMs = Date.now()
-    const { state, events } = reduceRunner(runnerRef.current, { type: action }, nowMs)
-    if (state === runnerRef.current) return
-    commitRunner(state)
-    applyEvents(events, nowMs)
-  }
-
-  async function resumeProtocol(): Promise<void> {
-    // 0x07 again first: a pause sent 0x08, and the trainer applies no ERG target
-    // until it has been started once more.
-    if (!(await ensureStarted())) return
-    dispatchRunner("resume")
+    if (next === "manual-power") void controller.sendManualPower(manualTargetW)
+    else if (next === "manual-resistance") void controller.sendManualResistance(manualResistancePct)
   }
 
   /* -------------------------------------------------------------- recording */
 
   function startRecording(): void {
     const startedAtMs = Date.now()
-    logRef.current = createSessionLog(startedAtMs)
+    const log = createSessionLog(startedAtMs)
+    controller._task8Log = log
     setRecording(true)
     recordingRef.current = true
     setSampleCount(0)
-    appendEvent(logRef.current, {
+    appendEvent(log, {
       epochMs: startedAtMs,
       elapsedS: 0,
       mode,
@@ -871,17 +543,17 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   function stopRecording(): void {
     setRecording(false)
     recordingRef.current = false
-    setSampleCount(logRef.current?.samples.length ?? 0)
+    setSampleCount(controller._task8Log?.samples.length ?? 0)
   }
 
   function clearRecording(): void {
-    logRef.current = null
+    controller._task8Log = null
     setSampleCount(0)
   }
 
   /** The Blob dance from page.tsx's exportToCSV; one file, samples and events together. */
   function exportCsv(): void {
-    const log = logRef.current
+    const log = controller._task8Log
     if (!log || log.samples.length === 0) return
     const blob = new Blob([sessionLogToCsv(log)], { type: "text/csv" })
     const url = URL.createObjectURL(blob)
@@ -908,8 +580,8 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     const preset = presets.find((candidate) => candidate.id === id)
     if (!preset) return
     setSelectedPresetId(id)
-    setProtocolName(preset.name)
-    setSteps(preset.steps.map((step) => ({ ...step })))
+    controller.setProtocolName(preset.name)
+    controller.setSteps(preset.steps.map((step) => ({ ...step })))
   }
 
   function savePresetFromEditor(): void {
@@ -932,11 +604,11 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       const problem = next.some((preset) => preset.name === name && preset.builtIn)
         ? `"${name}" is a built-in preset's name - choose another`
         : (validateSteps(steps) ?? "give the protocol a name first")
-      setError(`Preset not saved: ${problem}.`)
+      controller.setError(`Preset not saved: ${problem}.`)
       return
     }
 
-    setError("")
+    controller.setError("")
     setSelectedPresetId(saved.id)
   }
 
@@ -949,17 +621,16 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
   useEffect(() => {
     if (runner.status !== "running") return
-    const interval = setInterval(() => tickRunner(Date.now()), RUNNER_TICK_MS)
+    const interval = setInterval(() => controller.tick(Date.now()), RUNNER_TICK_MS)
     // A hidden tab's interval is throttled or suspended; this catches the runner
     // up the instant the tab is looked at again.
-    const onVisibilityChange = () => tickRunner(Date.now())
+    const onVisibilityChange = () => controller.tick(Date.now())
     document.addEventListener("visibilitychange", onVisibilityChange)
     return () => {
       clearInterval(interval)
       document.removeEventListener("visibilitychange", onVisibilityChange)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- tickRunner reads refs only.
-  }, [runner.status])
+  }, [controller, runner.status])
 
   /*
    * Drives `stale` and the elapsed labels. Gated on there being a reading to
@@ -985,12 +656,13 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       // panel on every later drop.
       deviceRef.current?.removeEventListener("gattserverdisconnected", onGattDisconnected)
       deviceRef.current = null
-      void sessionRef.current?.dispose()
-      sessionRef.current = null
+      // The session is the controller's; Task 8 replaces this with
+      // controller.dispose(), which also cancels the two timers below.
+      void controller.disposeSession()
       throttleRef.current.cancel()
       if (manualTimerRef.current !== null) clearTimeout(manualTimerRef.current)
     },
-    [onGattDisconnected],
+    [controller, onGattDisconnected],
   )
 
   /* ------------------------------------------------------------------ render */
@@ -1031,7 +703,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     totalElapsedS: view.totalElapsedS,
     protocolDurationS: protocolDurationSeconds(runner.protocol),
     recording,
-    logStartedAtMs: logRef.current?.startedAtMs ?? null,
+    logStartedAtMs: controller._task8Log?.startedAtMs ?? null,
     nowMs: nowTick || Date.now(),
   })
 
@@ -1065,7 +737,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
               </Button>
             )}
             {connected && !hasControl && (
-              <Button variant="outline" onClick={takeControl}>
+              <Button variant="outline" onClick={() => void controller.takeControl()}>
                 Take Control
               </Button>
             )}
@@ -1145,9 +817,9 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         <>
           <TrainerStepEditor
             steps={steps}
-            onStepsChange={setSteps}
+            onStepsChange={(next: ProtocolStep[]) => controller.setSteps(next)}
             protocolName={protocolName}
-            onNameChange={setProtocolName}
+            onNameChange={(next: string) => controller.setProtocolName(next)}
             presets={presets}
             selectedPresetId={selectedPresetId}
             onLoadPreset={loadPreset}
@@ -1162,21 +834,37 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
             </CardHeader>
             <CardContent className="flex flex-wrap items-center gap-2">
               <Button
-                onClick={startProtocol}
+                onClick={() => void controller.startProtocol()}
                 disabled={!connected || protocolActive || starting || validateSteps(steps) !== null}
               >
                 {starting ? "Starting…" : "Start"}
               </Button>
-              <Button variant="outline" onClick={() => dispatchRunner("pause")} disabled={runner.status !== "running"}>
+              <Button
+                variant="outline"
+                onClick={() => controller.dispatchRunner({ type: "pause" })}
+                disabled={runner.status !== "running"}
+              >
                 Pause
               </Button>
-              <Button variant="outline" onClick={resumeProtocol} disabled={runner.status !== "paused"}>
+              <Button
+                variant="outline"
+                onClick={() => void controller.resumeProtocol()}
+                disabled={runner.status !== "paused"}
+              >
                 Resume
               </Button>
-              <Button variant="outline" onClick={() => dispatchRunner("skip")} disabled={!protocolActive}>
+              <Button
+                variant="outline"
+                onClick={() => controller.dispatchRunner({ type: "skip" })}
+                disabled={!protocolActive}
+              >
                 Skip step
               </Button>
-              <Button variant="outline" onClick={() => dispatchRunner("stop")} disabled={!protocolActive}>
+              <Button
+                variant="outline"
+                onClick={() => controller.dispatchRunner({ type: "stop" })}
+                disabled={!protocolActive}
+              >
                 Stop
               </Button>
               <span className="text-sm text-gray-500">
@@ -1218,7 +906,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
             <Button variant="outline" onClick={exportCsv} disabled={sampleCount === 0}>
               Export CSV
             </Button>
-            <Button variant="outline" onClick={clearRecording} disabled={recording || logRef.current === null}>
+            <Button variant="outline" onClick={clearRecording} disabled={recording || controller._task8Log === null}>
               Clear
             </Button>
             <span className="text-sm text-gray-500 tabular-nums">
