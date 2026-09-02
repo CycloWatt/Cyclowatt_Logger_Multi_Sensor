@@ -63,13 +63,13 @@ import {
   FTMS_OPTIONAL_SERVICES,
   FTMS_RESULT,
   FTMS_SERVICE_UUID,
-  clampToRange,
   type FtmsStatus,
 } from "@/lib/ftms/protocol"
+import { planRunnerEffects, type PlannedOp } from "@/lib/trainer/control-plan"
 import { elapsedLabel, isStale, stepLabel, targetLabel } from "@/lib/trainer/labels"
 import { logProtocolName, logStepIndex } from "@/lib/trainer/log-context"
 import { deletePreset, readPresets, savePreset, validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
-import { FINISH_TARGET_W, liveTargetW, protocolTargetW, resistanceTenthsFromPct } from "@/lib/trainer/targets"
+import { liveTargetW, protocolTargetW, resistanceTenthsFromPct } from "@/lib/trainer/targets"
 import {
   createRunner,
   protocolDurationSeconds,
@@ -339,91 +339,73 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
    * `send: false` is for the two cases where the runner moves BECAUSE the link
    * is gone - a disconnect or a revoked control - and a write would only queue
    * up behind a dead Control Point.
+   *
+   * Every DECISION here - which rows, which opcodes, in which order, under
+   * which labels, and how `startedRef` moves - lives in planRunnerEffects
+   * (lib/trainer/control-plan.ts), behind an exhaustive unit test. What is
+   * left below is the interpreter that puts that plan on the wire.
    */
   function applyEvents(events: RunnerEvent[], nowMs: number, options: { send?: boolean } = {}): void {
-    for (const event of events) {
-      switch (event.type) {
-        case "step-started":
-          logEvent("step-started", `step ${event.stepIndex + 1} target ${event.targetWatts} W`, nowMs)
-          break
-        case "resumed":
-          logEvent("resumed", `target ${event.targetWatts} W`, nowMs)
-          break
-        case "paused":
-          logEvent("paused", "", nowMs)
-          break
-        case "stopped":
-          logEvent("stopped", "", nowMs)
-          break
-        case "finished":
-          logEvent("finished", "", nowMs)
-          break
-      }
-    }
-
     const session = sessionRef.current
-    if (options.send === false || !session) return
+    const started = startedRef.current
+    const plan = planRunnerEffects({
+      events,
+      started,
+      powerRange: session?.capabilities.powerRange ?? DEFAULT_POWER_RANGE,
+      runnerStatusAfter: runnerRef.current.status,
+      send: options.send !== false && session !== null,
+    })
 
-    const finishing = events.some((event) => event.type === "finished" || event.type === "stopped")
-    if (finishing) {
-      /*
-       * Not the last step's target: see FINISH_TARGET_W. Unlike the step targets
-       * below, this one is sent even from a paused runner - Stop while paused -
-       * because nothing later would re-send it and the rider is coasting: landing
-       * on 50 W is the whole intent. But a paused trainer has already had 0x08,
-       * so it applies no target at all; the 0x07 below is what makes the 50 W
-       * actually take effect instead of being acknowledged and dropped.
-       *
-       * Serialised in one async run rather than three fire-and-forget calls, so
-       * the order on the wire is 0x07 -> target -> 0x08 whatever the queue does.
-       */
-      const watts = clampToRange(FINISH_TARGET_W, session.capabilities.powerRange)
-      const stopping = events.some((event) => event.type === "stopped")
-      const needsRestart = !startedRef.current
-      /*
-       * 0x08 puts the trainer back in the state where it honours no ERG target,
-       * so the next run has to send 0x07 again (see ensureStarted). Set NOW, not
-       * after the await: a fast Start click must not find a stale `true` while
-       * these writes are still queued.
-       */
-      if (stopping) startedRef.current = false
-      void (async () => {
-        if (needsRestart) {
-          const restarted = await sendControl(
-            "Start or Resume (for the protocol-end target)",
-            () => session.start(),
-          )
-          if (!restarted) return
-          if (!stopping) startedRef.current = true
-        }
-        await sendControl(`Set Target Power ${watts} W (protocol end)`, () => session.setTargetPower(watts))
-        if (stopping) await sendControl("Stop", () => session.stop(), { restartAfterRetake: false })
-      })()
-    } else if (runnerRef.current.status !== "paused") {
-      /*
-       * Only the LAST target of the batch - see WHY WALL-CLOCK TICKS.
-       *
-       * And nothing at all while the runner is paused, which is Skip-while-paused:
-       * the panel has already sent 0x08, so the trainer holds no target and would
-       * ACKNOWLEDGE the write while ignoring it - logging a "-> success" for a
-       * target that never took effect, the single most misleading line a session
-       * log can carry. Resume re-sends the current step's target anyway, and by
-       * the time a `resumed` event reaches here commitRunner has already moved the
-       * status to "running", so this guard never blocks that.
-       */
-      let target: number | null = null
-      for (const event of events) {
-        if (event.type === "step-started" || event.type === "resumed") target = event.targetWatts
-      }
-      if (target !== null) {
-        const watts = target
-        void sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))
+    // Rows first, in event order - and written even when nothing is sent.
+    for (const row of plan.rows) logEvent(row.event, row.detail, nowMs)
+
+    if (!session || plan.ops.length === 0) return
+
+    /*
+     * Stop's 0x08 puts the trainer back in the state where it honours no ERG
+     * target, so the next run has to send 0x07 again (see ensureStarted). Set
+     * NOW, before any await: a fast Start click must not find a stale `true`
+     * while these writes are still queued. Only ever a clear - the plan never
+     * claims a trainer started that the ops below have not started.
+     */
+    if (plan.startedBeforeOps !== started) startedRef.current = plan.startedBeforeOps
+
+    /** One planned op on the wire. Its label is the `control-result` row it logs. */
+    const issue = (op: PlannedOp): Promise<boolean> => {
+      switch (op.kind) {
+        case "start":
+          return sendControl(op.label, () => session.start())
+        case "targetPower":
+          return sendControl(op.label, () => session.setTargetPower(op.watts))
+        case "stop":
+          return sendControl(op.label, () => session.stop(), { restartAfterRetake: false })
+        case "pause":
+          return sendControl(op.label, () => session.pause(), { restartAfterRetake: false })
       }
     }
 
-    if (events.some((event) => event.type === "paused")) {
-      void sendControl("Pause", () => session.pause(), { restartAfterRetake: false })
-      startedRef.current = false // as for Stop above: Resume must re-send 0x07.
+    if (plan.sequencing === "chain") {
+      // The protocol-end ops, serialised in one async run rather than fired as
+      // independent calls, so the order on the wire is 0x07 -> target -> 0x08
+      // whatever the queue does - and a failed 0x07 abandons the rest.
+      void (async () => {
+        for (const op of plan.ops) {
+          const acknowledged = await issue(op)
+          if (op.kind !== "start") continue
+          if (!acknowledged) {
+            if (plan.abortChainOnStartFailure) return
+            continue
+          }
+          if (op.markStartedOnSuccess) startedRef.current = true
+        }
+      })()
+      return
+    }
+
+    // A step target and a Pause are each fired without awaiting the other one.
+    for (const op of plan.ops) {
+      void issue(op)
+      if (op.kind === "pause") startedRef.current = false // as for Stop above: Resume must re-send 0x07.
     }
   }
 
