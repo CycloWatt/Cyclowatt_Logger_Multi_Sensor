@@ -174,6 +174,14 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   const [error, setError] = useState("")
 
   const sessionRef = useRef<FtmsSession | null>(null)
+  /**
+   * The device the `gattserverdisconnected` listener is attached to.
+   *
+   * A BluetoothDevice outlives this component - the browser keeps it for the
+   * life of the grant - so the unmount effect MUST detach the listener from it,
+   * and a `[]`-dep effect cannot see the `device` state. Hence the mirror.
+   */
+  const deviceRef = useRef<BluetoothDevice | null>(null)
   /** Has Start or Resume (0x07) been sent since control was acquired? The Kickr honours ERG targets only after it. */
   const startedRef = useRef(false)
   const hasControlRef = useRef(false)
@@ -357,7 +365,13 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
     const finishing = events.some((event) => event.type === "finished" || event.type === "stopped")
     if (finishing) {
-      // Not the last step's target: see FINISH_TARGET_W.
+      /*
+       * Not the last step's target: see FINISH_TARGET_W. Sent even from a paused
+       * runner (Stop while paused), unlike the step targets below: the trainer
+       * acknowledges it either way, and it is what puts the machine at an easy
+       * spin the moment the following Stop releases it. Nothing later would
+       * re-send it, which is exactly why the step-target guard cannot apply here.
+       */
       const watts = clampToRange(FINISH_TARGET_W, session.capabilities.powerRange)
       void sendControl(`Set Target Power ${watts} W (protocol end)`, () => session.setTargetPower(watts))
       if (events.some((event) => event.type === "stopped")) {
@@ -366,8 +380,18 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         // so the next run has to send 0x07 again - see ensureStarted.
         startedRef.current = false
       }
-    } else {
-      // Only the LAST target of the batch - see WHY WALL-CLOCK TICKS.
+    } else if (runnerRef.current.status !== "paused") {
+      /*
+       * Only the LAST target of the batch - see WHY WALL-CLOCK TICKS.
+       *
+       * And nothing at all while the runner is paused, which is Skip-while-paused:
+       * the panel has already sent 0x08, so the trainer holds no target and would
+       * ACKNOWLEDGE the write while ignoring it - logging a "-> success" for a
+       * target that never took effect, the single most misleading line a session
+       * log can carry. Resume re-sends the current step's target anyway, and by
+       * the time a `resumed` event reaches here commitRunner has already moved the
+       * status to "running", so this guard never blocks that.
+       */
       let target: number | null = null
       for (const event of events) {
         if (event.type === "step-started" || event.type === "resumed") target = event.targetWatts
@@ -538,6 +562,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     // listener, and every later drop would run the handler twice.
     target.removeEventListener("gattserverdisconnected", onGattDisconnected)
     target.addEventListener("gattserverdisconnected", onGattDisconnected)
+    deviceRef.current = target
     logEvent("connected", target.name || "Trainer")
 
     if (await sendControl("Request Control", () => session.requestControl())) markControl(true)
@@ -628,8 +653,9 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   }
 
   async function disconnectTrainer(): Promise<void> {
-    const target = device
+    const target = device ?? deviceRef.current
     target?.removeEventListener("gattserverdisconnected", onGattDisconnected)
+    deviceRef.current = null
     await sessionRef.current?.dispose()
     sessionRef.current = null
     try {
@@ -637,7 +663,19 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     } catch (err) {
       console.warn("Trainer disconnect: gatt.disconnect() failed", err)
     }
-    logEvent("disconnected", "disconnected by the operator")
+
+    const nowMs = Date.now()
+    // Exactly as handleDisconnected does, and for the same reason: a runner left
+    // running with no session keeps ticking step boundaries and logging
+    // step-started rows for targets nothing can receive. No BLE sends - the
+    // session is already disposed.
+    if (runnerRef.current.status === "running") {
+      const { state, events } = reduceRunner(runnerRef.current, { type: "pause" }, nowMs)
+      commitRunner(state)
+      applyEvents(events, nowMs, { send: false })
+    }
+
+    logEvent("disconnected", "disconnected by the operator", nowMs)
     setConnected(false)
     markControl(false)
     startedRef.current = false
@@ -794,11 +832,31 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   }
 
   function savePresetFromEditor(): void {
+    const name = protocolName.trim()
     // No id: savePreset matches on the trimmed name, and handing it a built-in's
     // id would mint a user preset wearing that id.
     const next = savePreset({ name: protocolName, steps })
     setPresets(next)
-    setSelectedPresetId(next.find((preset) => preset.name === protocolName.trim())?.id ?? null)
+
+    /*
+     * savePreset REFUSES silently - it returns the list unchanged and touches the
+     * store not at all - for a name that collides with a built-in or for invalid
+     * steps. An operator who pressed Save and saw nothing happen cannot tell that
+     * from a save that worked, so the refusal is detected here (no user preset
+     * under that name came back) and said out loud. The selection is left alone:
+     * nothing changed, so nothing should look as though it had.
+     */
+    const saved = next.find((preset) => preset.name === name && !preset.builtIn)
+    if (!saved) {
+      const problem = next.some((preset) => preset.name === name && preset.builtIn)
+        ? `"${name}" is a built-in preset's name - choose another`
+        : (validateSteps(steps) ?? "give the protocol a name first")
+      setError(`Preset not saved: ${problem}.`)
+      return
+    }
+
+    setError("")
+    setSelectedPresetId(saved.id)
   }
 
   function removePreset(id: string): void {
@@ -822,22 +880,36 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     // eslint-disable-next-line react-hooks/exhaustive-deps -- tickRunner reads refs only.
   }, [runner.status])
 
-  // Drives `stale` and the elapsed labels while connected; without it a trainer
-  // that goes quiet would keep showing its last numbers as if they were live.
+  /*
+   * Drives `stale` and the elapsed labels. Gated on there being a reading to
+   * grey rather than on `connected`: a LINK LOSS is exactly the case where the
+   * last power and cadence must stop looking live, and an interval that stopped
+   * with the connection would freeze `stale` at false forever.
+   */
+  const hasReading = live !== null
   useEffect(() => {
-    if (!connected) return
+    if (!connected && !hasReading) return
     const interval = setInterval(() => setNowTick(Date.now()), 1000)
     return () => clearInterval(interval)
-  }, [connected])
+    // Deliberately the BOOLEAN, not `live`: `live` is a fresh object on every
+    // flush, and depending on it would tear the interval down and rebuild it
+    // four times a second - so it would never actually reach one second.
+  }, [connected, hasReading])
 
   useEffect(
     () => () => {
+      // Through deviceRef, not the `device` state: this closure is created once,
+      // so it would otherwise always see `null` and leave the listener attached
+      // to a BluetoothDevice that outlives the component - firing into a dead
+      // panel on every later drop.
+      deviceRef.current?.removeEventListener("gattserverdisconnected", onGattDisconnected)
+      deviceRef.current = null
       void sessionRef.current?.dispose()
       sessionRef.current = null
       if (flushTimerRef.current !== null) clearTimeout(flushTimerRef.current)
       if (manualTimerRef.current !== null) clearTimeout(manualTimerRef.current)
     },
-    [],
+    [onGattDisconnected],
   )
 
   /* ------------------------------------------------------------------ render */
