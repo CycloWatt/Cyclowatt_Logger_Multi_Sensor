@@ -25,6 +25,7 @@ import { SMP_SERVICE_UUID } from "@/lib/smp/client"
 import { BOARD_NAME_PREFIXES, BOARD_NAME_PREFIX_HINT, firmwareVersionFromName, isBoardName } from "@/lib/device-name"
 import { applyDeviceName, nextDisplayName } from "@/lib/device-list"
 import { readGapDeviceName } from "@/lib/gap-name"
+import { parseCyclingPowerMeasurement } from "@/lib/cps/measurement"
 import { CPS_SERVICE_UUID } from "@/lib/cps/protocol"
 import { CalibrationCard, type CalibrationReading } from "@/components/calibration-card"
 import { CalibrationHistoryCard } from "@/components/calibration-history-card"
@@ -850,11 +851,10 @@ export default function BluetoothDataLogger() {
   const handleReferencePowerNotification = (event: Event) => {
     const target = event.target as BluetoothRemoteGATTCharacteristic
     const dataView = target.value
-    if (!dataView || dataView.byteLength < 4) return
+    if (!dataView) return
 
-    // Byte 0-1: flags (uint16, little-endian)
-    // Byte 2-3: instantaneous power (sint16, watts, little-endian)
-    const instantaneousPower = dataView.getInt16(2, true)
+    const instantaneousPower = parseCyclingPowerMeasurement(dataView)
+    if (instantaneousPower === null) return
     refPowerValueRef.current = instantaneousPower
     setLatestRefPower(instantaneousPower)
   }
