@@ -44,6 +44,9 @@ import {
   forceChannelLabel,
   forceDataKey,
 } from "@/lib/raw-stream/force-channels"
+import { readBenchPrefs, writeBenchPrefs } from "@/lib/bench-prefs"
+import { parseDataPacket as parsePacket, type DataPoint } from "@/lib/raw-stream/packet"
+import { rawCsvFilename, rawStreamToCsv } from "@/lib/raw-stream/csv"
 import { DfuCard } from "@/components/dfu-card"
 import { TrainerPanel } from "@/components/trainer-panel"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
@@ -53,61 +56,6 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 // cost of a capture, and the log strings were built even with DevTools closed.
 // Flip to true only when actually debugging the packet stream.
 const DEBUG_PACKET_LOG = false
-
-// One localStorage record for the bench switches (CSV capture, chooser
-// filter), so a page reload keeps the operator's setup. Same store-and-key
-// style as the flash history ("cyclowatt-flash-history").
-const PREFS_KEY = "cyclowatt-bench-prefs"
-
-interface BenchPrefs {
-  csvCaptureEnabled?: boolean
-  useDeviceFilter?: boolean
-}
-
-// Read/write are both best-effort: localStorage can throw (blocked cookies,
-// storage-restricted embeds), and prefs must never take the logger down.
-function readBenchPrefs(): BenchPrefs {
-  try {
-    const raw = window.localStorage.getItem(PREFS_KEY)
-    if (!raw) return {}
-    const parsed: unknown = JSON.parse(raw)
-    return typeof parsed === "object" && parsed !== null ? (parsed as BenchPrefs) : {}
-  } catch {
-    return {}
-  }
-}
-
-function writeBenchPrefs(update: Partial<BenchPrefs>): void {
-  try {
-    window.localStorage.setItem(PREFS_KEY, JSON.stringify({ ...readBenchPrefs(), ...update }))
-  } catch {
-    // non-fatal - the switch still works for this session
-  }
-}
-
-interface DataPoint {
-  timestamp: number
-  // Pre-formatted chart label for `timestamp`. Formatted ONCE here at parse
-  // time: formatting on every chart tick meant 500 Intl calls per 100 ms.
-  timeLabel: string
-  tick: number
-  ticksMcu: number
-  force0: number
-  force1: number
-  force2: number
-  force3: number
-  force4: number
-  force5: number
-  accelX: number
-  accelY: number
-  accelZ: number
-  gyroX: number
-  gyroY: number
-  gyroZ: number
-  power: number
-  referencePower: number
-  synchronization: number
-}
 
 // A type alias, not an interface, on purpose: aliases get TypeScript's implicit
 // index signature, which lets ChartDataPoint[] flow into the chart card's
@@ -603,9 +551,6 @@ export default function BluetoothDataLogger() {
   // from lib/cps/protocol, which the calibration flow shares - two copies of it
   // could drift and the symptom would be a SecurityError seconds into a procedure.
   const CPS_MEASUREMENT_CHAR_UUID = "00002a63-0000-1000-8000-00805f9b34fb" // cycling_power_measurement
-
-  // Expected packet: 16 x int32 = 64 bytes
-  const EXPECTED_PACKET_SIZE = 64
 
   // Check browser compatibility on mount
   useEffect(() => {
@@ -1382,94 +1327,33 @@ export default function BluetoothDataLogger() {
     }
   }
 
+  // The decode itself lives in lib/raw-stream/packet.ts (pure, and pinned by
+  // test vectors). What stays here is what only the page can supply: the two
+  // stamped values that are not on the wire, and the per-packet debug log, which
+  // needs the packet COUNTER the page owns.
   const parseDataPacket = (dataView: DataView): DataPoint | null => {
-    if (dataView.byteLength !== EXPECTED_PACKET_SIZE) {
-      console.warn(`❌ Invalid packet size: ${dataView.byteLength} bytes, expected ${EXPECTED_PACKET_SIZE}`)
-      return null
+    const labelDate = new Date()
+    const dataPoint = parsePacket(dataView, {
+      timestamp: labelDate,
+      referencePower: refPowerValueRef.current,
+      synchronization: serialValueRef.current,
+    })
+    if (!dataPoint) return null
+
+    if (DEBUG_PACKET_LOG) {
+      const iso = labelDate.toISOString()
+      const { tick, ticksMcu, force0, force1, force2, force3, force4, force5, power } = dataPoint
+      const { accelX, accelY, accelZ, gyroX, gyroY, gyroZ } = dataPoint
+      console.log(`[${iso}] Packet #${packetCountRef.current + 1} tick=${tick} ticksMcu=${ticksMcu}`)
+      console.log(
+        `[${iso}] Force=[${force0}, ${force1}, ${force2}, ${force3}, ${force4}, ${force5}] PowerSlot=${power}`,
+      )
+      console.log(
+        `[${iso}] Accel=[${accelX}, ${accelY}, ${accelZ}] Gyro=[${gyroX}, ${gyroY}, ${gyroZ}] Sync=${serialValueRef.current}`,
+      )
     }
 
-    try {
-      // 6 force channels (load cell values) — raw integers, not scaled.
-      //
-      // The wire slot IS the board's amp channel: the firmware reads Vout_meas_1..6
-      // into force_mv[0..5] straight (power-meter-fw src/drivers/force_sensor.c)
-      // and raw_stream_wire.c packs slot i to slot i, so no permutation happens
-      // anywhere between the ADC and here. Positions per slot live in
-      // lib/raw-stream/force-channels.ts — the one place that mapping is written.
-      const force0 = dataView.getInt32(0, true) // index 0 — front-right (J2)
-      const force1 = dataView.getInt32(4, true) // index 1 — back (J4)
-      const force2 = dataView.getInt32(8, true) // index 2 — front-left (J5)
-      const force3 = dataView.getInt32(12, true) // index 3 — front-right (J2)
-      const force4 = dataView.getInt32(16, true) // index 4 — back (J4)
-      const force5 = dataView.getInt32(20, true) // index 5 — front-left (J5)
-
-      // Accel — packed as milli-g, so /1000 yields g
-      const accelX = dataView.getInt32(24, true) / 1000 // index 6
-      const accelY = dataView.getInt32(28, true) / 1000 // index 7
-      const accelZ = dataView.getInt32(32, true) / 1000 // index 8
-
-      // Gyro — packed as milli-rad/s, so /1000 yields rad/s
-      const gyroX = dataView.getInt32(36, true) / 1000 // index 9
-      const gyroY = dataView.getInt32(40, true) / 1000 // index 10
-      const gyroZ = dataView.getInt32(44, true) / 1000 // index 11
-
-      // Power — frozen zero-fill slot, never a reading (see chartConfig.power).
-      // Parsed and exported anyway so the CSV column set stays stable.
-      const power = dataView.getInt32(48, true) // index 12
-
-      // Tick — raw integer
-      const tick = dataView.getInt32(52, true) // index 13
-
-      // ticks_mcu is a uint64 split into low/high uint32
-      const ticksLow = dataView.getUint32(56, true) // index 14 — lower 32 bits
-      const ticksHigh = dataView.getUint32(60, true) // index 15 — upper 32 bits
-      const ticksMcu = Number((BigInt(ticksHigh) << 32n) | BigInt(ticksLow))
-
-      const timestamp = Date.now()
-      const labelDate = new Date(timestamp)
-      const dataPoint: DataPoint = {
-        timestamp,
-        // Same "MM:SS.tenth" the chart axis always showed, hand-rolled: the
-        // toLocaleTimeString call it replaces goes through Intl, far too heavy
-        // for a per-packet path (and worse, it used to run per chart REDRAW).
-        timeLabel: `${String(labelDate.getMinutes()).padStart(2, "0")}:${String(
-          labelDate.getSeconds(),
-        ).padStart(2, "0")}.${Math.floor(labelDate.getMilliseconds() / 100)}`,
-        tick,
-        ticksMcu,
-        force0,
-        force1,
-        force2,
-        force3,
-        force4,
-        force5,
-        accelX,
-        accelY,
-        accelZ,
-        gyroX,
-        gyroY,
-        gyroZ,
-        power,
-        referencePower: refPowerValueRef.current,
-        synchronization: serialValueRef.current,
-      }
-
-      if (DEBUG_PACKET_LOG) {
-        const iso = labelDate.toISOString()
-        console.log(`[${iso}] Packet #${packetCountRef.current + 1} tick=${tick} ticksMcu=${ticksMcu}`)
-        console.log(
-          `[${iso}] Force=[${force0}, ${force1}, ${force2}, ${force3}, ${force4}, ${force5}] PowerSlot=${power}`,
-        )
-        console.log(
-          `[${iso}] Accel=[${accelX}, ${accelY}, ${accelZ}] Gyro=[${gyroX}, ${gyroY}, ${gyroZ}] Sync=${serialValueRef.current}`,
-        )
-      }
-
-      return dataPoint
-    } catch (error) {
-      console.error("❌ Error parsing data packet:", error)
-      return null
-    }
+    return dataPoint
   }
 
   // Start data streaming
@@ -1577,65 +1461,22 @@ export default function BluetoothDataLogger() {
     const recorded = dataBufferRef.current
     if (recorded.length === 0) return
 
-    const headers = [
-      "tick",
-      "ticks_mcu",
-      "force_0",
-      "force_1",
-      "force_2",
-      "force_3",
-      "force_4",
-      "force_5",
-      "accel_x",
-      "accel_y",
-      "accel_z",
-      "gyro_x",
-      "gyro_y",
-      "gyro_z",
-      "power",
-      "reference_power",
-      "synchronization",
-    ]
-    const csvContent = [
-      headers.join(","),
-      ...recorded.map((point) =>
-        [
-          point.tick,
-          point.ticksMcu,
-          point.force0,
-          point.force1,
-          point.force2,
-          point.force3,
-          point.force4,
-          point.force5,
-          point.accelX,
-          point.accelY,
-          point.accelZ,
-          point.gyroX,
-          point.gyroY,
-          point.gyroZ,
-          point.power,
-          point.referencePower,
-          point.synchronization,
-        ].join(","),
-      ),
-    ].join("\n")
+    // Columns, rows and filename all live in lib/raw-stream/csv.ts, where the
+    // 17 header strings are pinned by test - bench analysis scripts select them
+    // by name. What is left here is the Blob/anchor download dance, which needs
+    // a document.
+    const csvContent = rawStreamToCsv(recorded)
 
     const blob = new Blob([csvContent], { type: "text/csv" })
     const url = URL.createObjectURL(blob)
     const a = document.createElement("a")
     a.href = url
-    // Stamp the connected board's firmware version into the FILENAME only (CSV
-    // content stays byte-identical) so a bench capture is attributable to a build.
-    const timestampPart = new Date().toISOString().split("T")[0]
     // Read the LATCH, not `device?.name`: the usual bench order is record →
     // disconnect → export, and by export time handleDisconnection has already
     // nulled `device` while the recording survives and Export stays enabled — parsing
     // the live name here dropped the _fw tag exactly when it mattered most. The
     // live name is only a fallback for a session that predates the latch.
-    const fwVersion = connectedFwVersion ?? firmwareVersionFromName(device?.name)
-    const versionTag = fwVersion ? `_fw${fwVersion}` : ""
-    a.download = `cyclowatt_data_${timestampPart}${versionTag}.csv`
+    a.download = rawCsvFilename(new Date(), connectedFwVersion ?? firmwareVersionFromName(device?.name))
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
