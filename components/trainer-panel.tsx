@@ -360,7 +360,12 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       // Not the last step's target: see FINISH_TARGET_W.
       const watts = clampToRange(FINISH_TARGET_W, session.capabilities.powerRange)
       void sendControl(`Set Target Power ${watts} W (protocol end)`, () => session.setTargetPower(watts))
-      if (events.some((event) => event.type === "stopped")) void sendControl("Stop", () => session.stop())
+      if (events.some((event) => event.type === "stopped")) {
+        void sendControl("Stop", () => session.stop())
+        // 0x08 puts the trainer back in the state where it honours no ERG target,
+        // so the next run has to send 0x07 again - see ensureStarted.
+        startedRef.current = false
+      }
     } else {
       // Only the LAST target of the batch - see WHY WALL-CLOCK TICKS.
       let target: number | null = null
@@ -373,7 +378,10 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       }
     }
 
-    if (events.some((event) => event.type === "paused")) void sendControl("Pause", () => session.pause())
+    if (events.some((event) => event.type === "paused")) {
+      void sendControl("Pause", () => session.pause())
+      startedRef.current = false // as for Stop above: Resume must re-send 0x07.
+    }
   }
 
   function tickRunner(nowMs: number): void {
