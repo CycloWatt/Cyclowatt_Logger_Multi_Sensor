@@ -10,13 +10,10 @@
  * lib/ftms/, and ALL the orchestration - the chooser and its board guard, the
  * connect/reconnect/disconnect flows, the notification handlers, the runner, the
  * manual debounce, recording, and what goes in the session log - lives in
- * TrainerController (lib/trainer/controller.ts). What is left here is the
- * wiring, and four decisions worth explaining:
- *
- * WHY ONE PIECE OF STATE. The controller rebuilds a whole snapshot object on
- * every change, so a single `useState` fed from `subscribe` is both the cheapest
- * and the most honest mirror of it - and it is why this file holds no refs
- * mirroring rendered values: nothing on the notification path reads this render.
+ * TrainerController (lib/trainer/controller.ts), bound to React by the single
+ * hook below (hooks/use-trainer-controller.ts - construction, the snapshot
+ * mirror, teardown, and why each is shaped the way it is). What is left here is
+ * the layout and three decisions worth explaining:
  *
  * WHY ITS OWN ERROR LINE. The page's `error` is set and cleared by unrelated
  * board flows (streaming, DFU, calibration), so a trainer failure shown there
@@ -39,7 +36,7 @@
  * file the bytes and the filename, and the Blob dance below is all that is left.
  */
 
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -48,9 +45,8 @@ import { TrainerChart } from "@/components/trainer-chart"
 import { TrainerManualControls } from "@/components/trainer-manual-controls"
 import { TrainerReadouts } from "@/components/trainer-readouts"
 import { TrainerStepEditor } from "@/components/trainer-step-editor"
-import { openFtmsSession } from "@/lib/ftms/control"
+import { useTrainerController } from "@/hooks/use-trainer-controller"
 import { DEFAULT_POWER_RANGE, DEFAULT_RESISTANCE_RANGE } from "@/lib/ftms/protocol"
-import { TrainerController } from "@/lib/trainer/controller"
 import { elapsedLabel, isStale, stepLabel, targetLabel } from "@/lib/trainer/labels"
 import { deletePreset, readPresets, savePreset, validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
 import { liveTargetW } from "@/lib/trainer/targets"
@@ -68,49 +64,8 @@ export interface TrainerPanelProps {
 const RUNNER_TICK_MS = 250
 
 export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanelProps) {
-  /*
-   * The controller's board guard runs at click time, long after this effect; a
-   * ref rather than a render closure only because the controller's deps are
-   * built once. Task 9 moves this into the hook with the controller itself.
-   */
-  const boardDeviceIdRef = useRef(boardDeviceId)
-  useEffect(() => {
-    boardDeviceIdRef.current = boardDeviceId
-  }, [boardDeviceId])
-
-  /*
-   * The one collaborator that is not React. Created lazily in a ref so its
-   * injected closures are built exactly once and outlive every render; none of
-   * them touches `navigator` until it is called, so the static export can still
-   * prerender this page in node.
-   */
-  const controllerRef = useRef<TrainerController | null>(null)
-  if (controllerRef.current === null) {
-    controllerRef.current = new TrainerController({
-      openSession: openFtmsSession,
-      requestDevice: (options) => navigator.bluetooth.requestDevice(options),
-      // Called, not read: `connect()` must make the same call-time check the
-      // panel used to make, and this component is prerendered in node.
-      bluetoothAvailable: () => typeof navigator !== "undefined" && !!navigator.bluetooth,
-      boardDeviceId: () => boardDeviceIdRef.current,
-      now: () => Date.now(),
-      setTimer: (fn, ms) => setTimeout(fn, ms),
-      clearTimer: (handle) => clearTimeout(handle as Parameters<typeof clearTimeout>[0]),
-      log: console,
-    })
-  }
-  const controller = controllerRef.current
-
-  /*
-   * Subscribed in an effect - never during render - and re-read once on
-   * subscribe, in case a change landed between this render and the effect.
-   */
-  const [snapshot, setSnapshot] = useState(() => controller.snapshot)
-  useEffect(() => {
-    const unsubscribe = controller.subscribe(() => setSnapshot(controller.snapshot))
-    setSnapshot(controller.snapshot)
-    return unsubscribe
-  }, [controller])
+  /* The one collaborator that is not React, plus the mirror of its snapshot. */
+  const { snapshot, controller } = useTrainerController({ bluetoothAvailable, boardDeviceId })
   const {
     capabilities,
     chartData,
@@ -236,20 +191,6 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     // flush, and depending on it would tear the interval down and rebuild it
     // four times a second - so it would never actually reach one second.
   }, [controller, connected, hasReading])
-
-  /*
-   * Unmount: the controller lets go of the BluetoothDevice listener, the
-   * session and its two timers.
-   *
-   * The SAME effect the ref-based version used, deliberately: its only
-   * dependency is the controller instance, which is stable for the component's
-   * life, so the cleanup cannot fire mid-session. (Under StrictMode React does
-   * mount, clean up and re-mount every effect once in dev - harmless here,
-   * because that happens before anything is connected and dispose() on an idle
-   * controller touches nothing. A dispose keyed on anything that CHANGES during
-   * a session would tear a live one down; that is what to avoid.)
-   */
-  useEffect(() => () => controller.dispose(), [controller])
 
   /* ------------------------------------------------------------------ render */
 
