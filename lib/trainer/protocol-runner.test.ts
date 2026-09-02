@@ -191,6 +191,30 @@ describe("reduceRunner: pause / resume", () => {
     expect(result.state).toBe(running)
     expect(result.events).toEqual([])
   })
+
+  it("is a no-op to pause while already paused", () => {
+    const { state: running } = reduceRunner(createRunner(P4), { type: "start" }, T0)
+    const { state: paused } = reduceRunner(running, { type: "pause" }, T0 + 1000)
+    const result = reduceRunner(paused, { type: "pause" }, T0 + 2000)
+    expect(result.state).toBe(paused)
+    expect(result.events).toEqual([])
+  })
+
+  it("is a no-op to resume while stopped", () => {
+    const { state: running } = reduceRunner(createRunner(P2), { type: "start" }, T0)
+    const { state: stopped } = reduceRunner(running, { type: "stop" }, T0 + 1000)
+    const result = reduceRunner(stopped, { type: "resume" }, T0 + 2000)
+    expect(result.state).toBe(stopped)
+    expect(result.events).toEqual([])
+  })
+
+  it("is a no-op to resume while finished", () => {
+    const { state: running } = reduceRunner(createRunner(P2), { type: "start" }, T0)
+    const { state: finished } = reduceRunner(running, { type: "tick" }, T0 + 2 * D * 1000)
+    const result = reduceRunner(finished, { type: "resume" }, T0 + 3 * D * 1000)
+    expect(result.state).toBe(finished)
+    expect(result.events).toEqual([])
+  })
 })
 
 describe("reduceRunner: skip", () => {
@@ -219,6 +243,21 @@ describe("reduceRunner: skip", () => {
     expect(state.status).toBe("paused")
     expect(state.pausedAtMs).toBe(skipAt)
     expect(events).toEqual([{ type: "step-started", stepIndex: 1, targetWatts: 200 }])
+  })
+
+  it("finishes and clears pausedAtMs when skipping past the last step while paused", () => {
+    // The combination that exercises the finished branch's `pausedAtMs: null`
+    // override: paused on the LAST step, then skip. Status must land on
+    // "finished", not "paused" - a finished protocol is never paused.
+    const { state: running } = reduceRunner(createRunner(P2), { type: "start" }, T0)
+    const { state: onLast } = reduceRunner(running, { type: "skip" }, T0 + 20_000)
+    const { state: pausedOnLast } = reduceRunner(onLast, { type: "pause" }, T0 + 25_000)
+    expect(pausedOnLast.status).toBe("paused")
+
+    const { state, events } = reduceRunner(pausedOnLast, { type: "skip" }, T0 + 30_000)
+    expect(state.status).toBe("finished")
+    expect(state.pausedAtMs).toBeNull()
+    expect(events).toEqual([{ type: "finished" }])
   })
 
   it("is a no-op while idle", () => {
@@ -300,6 +339,50 @@ describe("runnerView", () => {
     expect(view.totalElapsedS).toBe(D + 10)
     expect(view.totalRemainingS).toBe(3 * D - (D + 10))
     expect(view.targetWatts).toBe(150)
+  })
+
+  it("after finishing (tick past the end): stepRemainingS 0, last step's info still shown, nothing negative", () => {
+    const { state: running } = reduceRunner(createRunner(P2), { type: "start" }, T0)
+    const { state: finished } = reduceRunner(running, { type: "tick" }, T0 + 2 * D * 1000)
+    expect(finished.status).toBe("finished")
+
+    // Called well after the finish, the way a panel still rendering the
+    // screen after the workout ended would call it.
+    const view = runnerView(finished, T0 + 2 * D * 1000 + 5000)
+
+    expect(view.stepRemainingS).toBe(0)
+    // Documented judgment call: stepIndex stays at the last valid step
+    // (never incremented past the end of the array), so currentStep and
+    // targetWatts keep describing the step the protocol just finished on
+    // rather than going null.
+    expect(view.stepIndex).toBe(1)
+    expect(view.currentStep).toEqual({ targetWatts: 200, durationSeconds: D })
+    expect(view.targetWatts).toBe(200)
+    expect(view.nextStep).toBeNull()
+
+    expect(view.stepElapsedS).toBeGreaterThanOrEqual(0)
+    expect(view.totalElapsedS).toBeGreaterThanOrEqual(0)
+    expect(view.totalRemainingS).toBeGreaterThanOrEqual(0)
+    expect(view.totalRemainingS).toBe(0)
+  })
+
+  it("after stopping: stepRemainingS 0, the step it stopped on is still shown, nothing negative", () => {
+    const { state: running } = reduceRunner(createRunner(P3), { type: "start" }, T0)
+    const { state: onStep1 } = reduceRunner(running, { type: "tick" }, T0 + D * 1000)
+    const { state: stopped } = reduceRunner(onStep1, { type: "stop" }, T0 + D * 1000 + 10_000)
+    expect(stopped.status).toBe("stopped")
+
+    const view = runnerView(stopped, T0 + D * 1000 + 20_000)
+
+    expect(view.stepRemainingS).toBe(0)
+    expect(view.stepIndex).toBe(1)
+    expect(view.currentStep).toEqual({ targetWatts: 150, durationSeconds: D })
+    expect(view.targetWatts).toBe(150)
+    expect(view.nextStep).toEqual({ targetWatts: 200, durationSeconds: D })
+
+    expect(view.stepElapsedS).toBeGreaterThanOrEqual(0)
+    expect(view.totalElapsedS).toBeGreaterThanOrEqual(0)
+    expect(view.totalRemainingS).toBeGreaterThanOrEqual(0)
   })
 })
 
