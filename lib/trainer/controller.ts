@@ -172,9 +172,11 @@ export interface TrainerControllerDeps {
   /**
    * Is Web Bluetooth there AT CALL TIME? A closure rather than a boolean
    * because the panel builds this controller during a render that the static
-   * export also runs in node, where `navigator` does not exist yet.
+   * export also runs in node, where `navigator` does not exist yet. Required:
+   * an absent probe would let `connect` open a chooser on a browser that has
+   * no Web Bluetooth instead of raising the panel's own message.
    */
-  bluetoothAvailable?: () => boolean
+  bluetoothAvailable: () => boolean
   /** The connected CycloWatt board, so the chooser can reject it. */
   boardDeviceId: () => string | null
   now: () => number
@@ -472,7 +474,7 @@ export class TrainerController {
    * service but not that name".
    */
   async connect(): Promise<void> {
-    if (this.deps.bluetoothAvailable && !this.deps.bluetoothAvailable()) {
+    if (!this.deps.bluetoothAvailable()) {
       this.setError("Web Bluetooth API is not supported in this browser.")
       return
     }
@@ -817,10 +819,15 @@ export class TrainerController {
           const acknowledged = await issue(op)
           if (op.kind !== "start") continue
           if (!acknowledged) {
+            // Every chain planned today sets abortChainOnStartFailure, so a
+            // refused 0x07 always abandons the rest rather than sending a target
+            // to a trainer that would ignore it. The flag stays a plan field so a
+            // chain that should carry on could be added deliberately; either way a
+            // failed start must never mark the trainer started, hence the `else`.
             if (plan.abortChainOnStartFailure) return
-            continue
+          } else if (op.markStartedOnSuccess) {
+            this.started = true
           }
-          if (op.markStartedOnSuccess) this.started = true
         }
       })()
       return
@@ -881,7 +888,13 @@ export class TrainerController {
     }
   }
 
-  dispatchRunner(action: RunnerAction): void {
+  /**
+   * Apply one OPERATOR action. `tick` is excluded on purpose: the clock-driven
+   * walk has its own entry point (`tick(nowMs)`), which is where the
+   * same-reference no-op check that keeps a 4 Hz interval from re-rendering
+   * lives - routing a tick through here would skip it.
+   */
+  dispatchRunner(action: Exclude<RunnerAction, { type: "tick" }>): void {
     const nowMs = this.deps.now()
     const { state, events } = reduceRunner(this.runner, action, nowMs)
     if (state === this.runner) return
