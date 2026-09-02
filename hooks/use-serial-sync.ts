@@ -1,3 +1,5 @@
+"use client"
+
 /**
  * The Web Serial "synchronization input": one bench cable whose latest numeric
  * line is stamped onto every raw-stream packet.
@@ -18,12 +20,16 @@
  * still lands, and `cancel()` on disconnect so a deferred flush cannot resurrect
  * the value the disconnect just zeroed.
  *
- * WHY `supported` IS AN INPUT, NOT DETECTED HERE: the page detects Web Serial in
+ * WHY `supported` IS AN INPUT AND NOT ALSO AN OUTPUT: the page detects Web Serial in
  * the same mount effect that detects Web Bluetooth and the secure context, in a
  * fixed order of console lines, and the same effect raises the shared HTTPS
  * error. Splitting the serial third into a hook effect would reorder those logs
  * (a hook's effect runs before the component's own), so the detection stays put
- * and its result is handed in.
+ * and its result is handed in - the option records which detection this hook
+ * belongs to. It is not handed back out, and the hook does not branch on it:
+ * `connectSerial` re-checks `"serial" in navigator` itself, so a mirrored
+ * `supported` on the returned shape would only be a second copy of the page's
+ * own value, free to disagree with it.
  */
 
 import { useRef, useState } from "react"
@@ -42,7 +48,6 @@ export interface UseSerialSyncOptions {
 }
 
 export interface SerialSync {
-  supported: boolean
   connected: boolean
   latestValue: number
   valueRef: React.MutableRefObject<number>
@@ -50,7 +55,7 @@ export interface SerialSync {
   disconnect: () => Promise<void>
 }
 
-export function useSerialSync({ supported, onError, debugLog = false }: UseSerialSyncOptions): SerialSync {
+export function useSerialSync({ onError, debugLog = false }: UseSerialSyncOptions): SerialSync {
   const [serialPort, setSerialPort] = useState<SerialPort | null>(null)
   const [isSerialConnected, setIsSerialConnected] = useState(false)
   const [latestSerialValue, setLatestSerialValue] = useState<number>(0)
@@ -164,7 +169,6 @@ export function useSerialSync({ supported, onError, debugLog = false }: UseSeria
   }
 
   return {
-    supported,
     connected: isSerialConnected,
     latestValue: latestSerialValue,
     valueRef: serialValueRef,

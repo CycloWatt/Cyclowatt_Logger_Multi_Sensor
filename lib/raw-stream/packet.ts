@@ -12,6 +12,10 @@
  * debug console block, and the buffers. What it hands in via `ctx` is everything
  * the sample carries that is NOT on the wire - the observation time, the
  * reference trainer's power, and the serial synchronization value.
+ *
+ * The two `console` calls below are the page's originals, kept verbatim (emoji
+ * included) so this move is byte-identical to what a bench operator already
+ * reads in the devtools console.
  */
 
 /** Expected packet: 16 x int32 = 64 bytes */

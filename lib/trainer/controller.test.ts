@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { FtmsControlError, type FtmsCapabilities, type FtmsSessionHandlers } from "../ftms/control"
-import { FTMS_OP, FTMS_RESULT, type FtmsStatus } from "../ftms/protocol"
+import { FTMS_OP, FTMS_OPTIONAL_SERVICES, FTMS_RESULT, type FtmsStatus } from "../ftms/protocol"
 import type { IndoorBikeData } from "../ftms/indoor-bike-data"
 import { CHART_MAX_POINTS } from "./chart-buffer"
 import { sessionLogFilename, sessionLogToCsv } from "./session-log"
@@ -164,8 +164,16 @@ function harness(
   const requestedOptions: RequestDeviceOptions[] = []
   let handlers: FtmsSessionHandlers | null = null
 
+  /** One-shot openSession rejection, so a reconnect can fail after a connect succeeded. */
+  let openSessionFailure: unknown
+
   const deps: TrainerControllerDeps = {
     openSession: async (device, sessionHandlers) => {
+      if (openSessionFailure !== undefined) {
+        const failure = openSessionFailure
+        openSessionFailure = undefined
+        throw failure
+      }
       opened.push(device)
       handlers = sessionHandlers
       return fake.session
@@ -222,6 +230,9 @@ function harness(
     requestedOptions,
     consoleLines,
     capabilityDumps,
+    failOpenSessionOnce: (error: unknown) => {
+      openSessionFailure = error
+    },
     /** The ms of every armed timer, so the 150 ms debounce and the 250 ms flush are visible. */
     pendingTimers: () => [...timers.values()].map((timer) => timer.ms),
     runTimers: () => {
@@ -285,6 +296,9 @@ describe("connect", () => {
       exclusionFilters?: unknown[]
     }
     expect(asked.filters).toEqual([{ services: ["00001826-0000-1000-8000-00805f9b34fb"] }])
+    // Every service the trainer might ever be asked for, declared up front: the
+    // grant Chrome makes here is the only one this device will ever have.
+    expect(asked.optionalServices).toEqual([...FTMS_OPTIONAL_SERVICES])
     expect(asked.exclusionFilters).toEqual([
       { namePrefix: "Cyclowatt" },
       { namePrefix: "CRaw" },
@@ -342,6 +356,14 @@ describe("connect", () => {
     expect(h.controller.snapshot.hasDevice).toBe(false)
   })
 
+  it('names a device that publishes no name "Trainer"', async () => {
+    const h = harness({ deviceName: null })
+    h.controller.startRecording()
+    await h.controller.connect()
+    expect(h.controller.snapshot.deviceName).toBe("Trainer")
+    expect(h.rows()).toContain("connected: Trainer")
+  })
+
   it("refuses without Web Bluetooth, without opening a chooser", async () => {
     const h = harness({ bluetoothAvailable: false })
     h.controller.startRecording()
@@ -387,6 +409,42 @@ describe("reconnect", () => {
     await flush()
     expect(h.calls).toEqual(["requestControl", "start", "setTargetPower:100"])
     expect(h.rows().at(-1)).toBe("target-set: 100 W (manual)")
+  })
+
+  it("re-sends the live manual resistance target, in manual-resistance mode", async () => {
+    const h = await connected()
+    h.controller.changeMode("manual-resistance")
+    await flush()
+    expect(h.controller.snapshot.manualTargetSent).toBe("resistance")
+    h.dev.dropLink()
+    await flush()
+    h.calls.length = 0
+
+    await h.controller.reconnect()
+    await flush()
+    // 20 %, the default: 51 tenths snapped onto the trainer's 1.0-level grid.
+    expect(h.calls).toEqual(["requestControl", "start", "setTargetResistance:50"])
+    expect(h.rows().at(-1)).toBe("target-set: 20 % -> 5 resistance level (manual)")
+    expect(h.controller.snapshot.manualTargetSent).toBe("resistance")
+  })
+
+  it("surfaces a failed re-open and stops claiming to be connecting", async () => {
+    const h = await connected()
+    h.dev.dropLink()
+    await flush()
+    h.calls.length = 0
+
+    h.failOpenSessionOnce(new Error("GATT operation failed for unknown reason."))
+    await h.controller.reconnect()
+    await flush()
+    expect(h.controller.snapshot.error).toBe(
+      "Trainer reconnect failed: GATT operation failed for unknown reason.",
+    )
+    expect(h.controller.snapshot.error.startsWith("Trainer reconnect failed: ")).toBe(true)
+    expect(h.controller.snapshot.connecting).toBe(false)
+    expect(h.controller.snapshot.connected).toBe(false)
+    // Kept, so the button can be pressed again.
+    expect(h.controller.snapshot.hasDevice).toBe(true)
   })
 
   it("does nothing without a device to re-open", async () => {
@@ -823,6 +881,28 @@ describe("pause, resume, skip and stop", () => {
     await flush()
     expect(h.calls).toEqual([])
     expect(h.rows().at(-1)).toBe("step-started: step 2 target 200 W")
+  })
+
+  it("finishes a skip past the last step with 0x07 and the 50 W end target, leaving it started", async () => {
+    const h = await running()
+    h.controller.dispatchRunner({ type: "pause" })
+    await flush()
+    h.calls.length = 0
+
+    h.controller.dispatchRunner({ type: "skip" }) // onto step 2, no write while paused
+    h.controller.dispatchRunner({ type: "skip" }) // past the last step: finished
+    await flush()
+    // No 0x08: finishing is not stopping, so the 0x07 the pause undid comes back
+    // and the protocol-end target lands on a started trainer.
+    expect(h.calls).toEqual(["start", "setTargetPower:50"])
+    expect(h.controller.snapshot.runner.status).toBe("finished")
+
+    // `started` is private, so it is observed the only way it is ever observable:
+    // the next op that would need 0x07 does not send one.
+    h.calls.length = 0
+    h.controller.changeMode("manual-power")
+    await flush()
+    expect(h.calls).toEqual(["setTargetPower:100"])
   })
 
   it("stops from paused with 0x07, the 50 W protocol-end target and then 0x08", async () => {

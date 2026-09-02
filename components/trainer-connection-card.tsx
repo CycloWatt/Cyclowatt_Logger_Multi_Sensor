@@ -23,7 +23,8 @@ export interface TrainerConnectionCardProps {
   hasDevice: boolean
   connected: boolean
   hasControl: boolean
-  deviceName: string | null
+  /** Always a string: the controller falls back to "Trainer", and "" before a pick. */
+  deviceName: string
   capabilities: FtmsCapabilities | null
   powerRange: SupportedRange
   resistanceRange: SupportedRange

@@ -27,3 +27,6 @@ yarn-error.log*
 next-env.d.ts
 # local static preview of a static-export build (see next.config.mjs)
 /.preview/
+
+# JetBrains IDEs
+.idea/
