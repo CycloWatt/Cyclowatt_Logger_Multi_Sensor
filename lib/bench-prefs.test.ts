@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it } from "vitest"
 import { BENCH_PREFS_KEY, readBenchPrefs, writeBenchPrefs, type BenchPrefs } from "./bench-prefs"
 import type { StringStore } from "./flash-history"
 
@@ -73,5 +73,51 @@ describe("BENCH_PREFS_KEY", () => {
   it("is the key previous sessions already wrote", () => {
     // Changing this string silently forgets every operator's saved setup.
     expect(BENCH_PREFS_KEY).toBe("cyclowatt-bench-prefs")
+  })
+})
+
+/**
+ * With NO store argument these exercise defaultStore(), reached through
+ * `window.localStorage` — whose mere ACCESS throws when the browser blocks site
+ * data, and which does not exist at all under the Next prerender (or here in the
+ * node test env). Same shape as lib/flash-history.test.ts's default-store block.
+ */
+describe("bench prefs default store", () => {
+  afterEach(() => {
+    delete (globalThis as { window?: unknown }).window
+  })
+
+  it("degrades to a forgetful store when there is no window (prerender / node)", () => {
+    expect("window" in globalThis).toBe(false)
+    expect(readBenchPrefs()).toEqual({})
+    expect(() => writeBenchPrefs({ csvCaptureEnabled: true })).not.toThrow()
+  })
+
+  it("degrades to a forgetful store when the browser blocks site data", () => {
+    // Site-data blocking surfaces as a throwing `localStorage` getter.
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        get localStorage(): never {
+          throw new Error("SecurityError: access to storage is denied")
+        },
+      },
+    })
+    expect(readBenchPrefs()).toEqual({})
+    expect(() => writeBenchPrefs({ useDeviceFilter: true })).not.toThrow()
+  })
+
+  it("returns defaults when the store's getItem itself throws", () => {
+    // A store can fail on READ too, not just on write: the mount effect must
+    // still hand the page a usable prefs object instead of hitting the root
+    // error boundary.
+    const unreadableStore: StringStore = {
+      getItem: () => {
+        throw new Error("SecurityError: access to storage is denied")
+      },
+      setItem: () => {},
+    }
+    expect(readBenchPrefs(unreadableStore)).toEqual({})
+    expect(writeBenchPrefs({ csvCaptureEnabled: true }, unreadableStore)).toEqual({ csvCaptureEnabled: true })
   })
 })
