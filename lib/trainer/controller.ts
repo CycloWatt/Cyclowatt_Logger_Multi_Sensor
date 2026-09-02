@@ -4,14 +4,15 @@
  *
  * WHY A CLASS AND NOT HOOKS. Everything here used to live in
  * components/trainer-panel.tsx as a bag of refs (`sessionRef`, `startedRef`,
- * `hasControlRef`, `runnerRef`, `startingRef`, …) because the notification path
- * must read the NEWEST value, never a value captured in a render closure. A
- * plain object's fields are exactly that, with none of the ceremony - and,
- * crucially, none of it needs a DOM, so the whole ordered effect stream (0x00
- * before 0x07 before 0x05, one `control-result` row per op) is testable in the
- * repo's node-only vitest with a fake session, the way lib/ftms/control.test.ts
- * tests the GATT layer. See .superpowers/sdd/refactor-feature-modules/design.md
- * for the Option 3 ruling and the behaviour inventory this class must preserve.
+ * `hasControlRef`, `runnerRef`, `startingRef`, `liveRef`, `recordingRef`, …)
+ * because the notification path must read the NEWEST value, never a value
+ * captured in a render closure. A plain object's fields are exactly that, with
+ * none of the ceremony - and, crucially, none of it needs a DOM, so the whole
+ * ordered effect stream (0x00 before 0x07 before 0x05, one `control-result` row
+ * per op) is testable in the repo's node-only vitest with a fake session and a
+ * fake device, the way lib/ftms/control.test.ts tests the GATT layer. See
+ * .superpowers/sdd/refactor-feature-modules/design.md for the Option 3 ruling
+ * and the behaviour inventory this class must preserve.
  *
  * WHY A SNAPSHOT + subscribe. React still has to render this state. Rather than
  * a dozen setState mirrors, the controller keeps ONE plain object rebuilt on
@@ -22,20 +23,31 @@
  * render.
  *
  * WHY EVERY COLLABORATOR IS INJECTED. `now`, `setTimer`/`clearTimer`,
- * `openSession`, `requestDevice`, `boardDeviceId` and `log` arrive as deps, so a
- * test can drive the clock and the trainer without a browser. There is no
- * `Date.now()`, `setTimeout` or `console` call in this file.
+ * `openSession`, `requestDevice`, `bluetoothAvailable`, `boardDeviceId` and
+ * `log` arrive as deps, so a test can drive the clock, the timers and the
+ * trainer without a browser. There is no `Date.now()`, `setTimeout`, `console`
+ * or `navigator` in this file - the two browser globals the connect flow needs
+ * are the panel's closures.
  *
- * WHAT IS STILL IN THE PANEL (Task 8 moves it here): the connect/reconnect/
- * disconnect flows, the notification handlers, recording, the manual debounce
- * and the mode switch. The methods marked `_task8` and the ones documented as
- * "Task 8 folds this into …" exist for exactly that seam and disappear with it.
+ * WHAT IS LEFT IN THE PANEL: the presets card (localStorage, no trainer I/O),
+ * the three timer effects that call in here, the Blob download that `csvForExport`
+ * feeds, and the layout. Nothing that talks to the trainer, and no mirror refs.
  */
 
-import type { FtmsCapabilities, FtmsSession, openFtmsSession } from "../ftms/control"
+import { isBoardName, BOARD_NAME_PREFIXES } from "../device-name"
+import type { FtmsCapabilities, FtmsServer, FtmsSession, FtmsSessionHandlers } from "../ftms/control"
 import { FtmsControlError } from "../ftms/control"
-import { DEFAULT_POWER_RANGE, FTMS_RESULT } from "../ftms/protocol"
+import type { IndoorBikeData } from "../ftms/indoor-bike-data"
+import {
+  DEFAULT_POWER_RANGE,
+  FTMS_OPTIONAL_SERVICES,
+  FTMS_RESULT,
+  FTMS_SERVICE_UUID,
+  type FtmsStatus,
+} from "../ftms/protocol"
+import { appendChartPoint, type TrainerChartPoint } from "./chart-buffer"
 import { planRunnerEffects, type PlannedOp } from "./control-plan"
+import { createThrottle } from "./display-throttle"
 import { logProtocolName, logStepIndex } from "./log-context"
 import type { TrainerMode } from "./mode"
 import { validateSteps } from "./presets"
@@ -47,8 +59,24 @@ import {
   type RunnerEvent,
   type RunnerState,
 } from "./protocol-runner"
-import { appendEvent, type LogEventKind, type SessionLog } from "./session-log"
+import {
+  appendEvent,
+  appendSample,
+  createSessionLog,
+  sessionLogFilename,
+  sessionLogToCsv,
+  type LogEventKind,
+  type SessionLog,
+} from "./session-log"
 import { protocolTargetW, resistanceTenthsFromPct, type ManualTargetSent } from "./targets"
+
+/** Display flush cadence: notifications arrive faster than a human reads. */
+const DISPLAY_FLUSH_MS = 250
+/** A slider drag or a held ±button fires far faster than the Control Point should. */
+const MANUAL_DEBOUNCE_MS = 150
+/** The panel's own starting values for the two manual sliders. */
+const DEFAULT_MANUAL_TARGET_W = 100
+const DEFAULT_MANUAL_RESISTANCE_PCT = 20
 
 /**
  * The part of `FtmsSession` this controller drives.
@@ -71,33 +99,72 @@ export type TrainerSession = Pick<
 >
 
 /**
- * Everything the panel renders from, as one plain object.
- *
- * Task 8 adds the fields it brings with it: `connecting`, `hasDevice`,
- * `manualTargetW`, `manualResistancePct`, `recording`, `sampleCount`, `hasLog`,
- * `logStartedAtMs`, `live`, `chartData` and `trainerReportedTargetW` - all of
- * them still React state in the panel while their owners are.
+ * The part of `BluetoothDevice` this controller holds on to: enough to open a
+ * session on it (`gatt`, via openFtmsSession's own `FtmsDevice`), to drop the
+ * link (`gatt.disconnect`), to hear about a drop, and to run the post-pick
+ * board guard (`name`, `id`). A real `BluetoothDevice` satisfies it.
  */
+export interface TrainerDevice {
+  id?: string
+  name?: string | null
+  gatt?: (FtmsServer & { disconnect: () => void }) | null
+  addEventListener(type: string, listener: () => void): void
+  removeEventListener(type: string, listener: () => void): void
+}
+
+/** One Indoor Bike Data notification, as the readouts show it. */
+export interface LiveSample {
+  powerW: number | null
+  cadenceRpm: number | null
+  speedKmh: number | null
+  hrBpm: number | null
+  receivedAtMs: number
+}
+
+/** Everything the panel renders from, as one plain object. */
 export interface TrainerSnapshot {
   connected: boolean
+  /** A chooser or a session open is in flight; both Connect and Reconnect use it. */
+  connecting: boolean
+  /** Is there a device to Reconnect to or Disconnect from? */
+  hasDevice: boolean
   deviceName: string
   capabilities: FtmsCapabilities | null
   hasControl: boolean
   error: string
   mode: TrainerMode
   manualTargetSent: ManualTargetSent
+  manualTargetW: number
+  manualResistancePct: number
   runner: RunnerState
   starting: boolean
   steps: ProtocolStep[]
   protocolName: string
+  recording: boolean
+  /** A log exists (recording or stopped-but-unexported), so Clear has something to drop. */
+  hasLog: boolean
+  logStartedAtMs: number | null
+  sampleCount: number
+  /** The throttled reading, not the newest one - see the display throttle. */
+  live: LiveSample | null
+  chartData: TrainerChartPoint[]
+  trainerReportedTargetW: number | null
+  /** Re-render clock, so `stale` and the elapsed labels move on their own. */
+  nowTick: number
 }
 
 export interface TrainerControllerDeps {
-  /** Task 8: the controller's own connect flow calls this; the panel still does today. */
-  openSession: typeof openFtmsSession
-  /** Task 8: the trainer's own chooser. */
-  requestDevice: (options: RequestDeviceOptions) => Promise<BluetoothDevice>
-  /** Task 8: the connected CycloWatt board, so the chooser can reject it. */
+  /** `openFtmsSession`, narrowed to what this class calls. */
+  openSession: (device: TrainerDevice, handlers: FtmsSessionHandlers) => Promise<TrainerSession>
+  /** The trainer's own chooser - see WHY ITS OWN CHOOSER on `connect`. */
+  requestDevice: (options: RequestDeviceOptions) => Promise<TrainerDevice>
+  /**
+   * Is Web Bluetooth there AT CALL TIME? A closure rather than a boolean
+   * because the panel builds this controller during a render that the static
+   * export also runs in node, where `navigator` does not exist yet.
+   */
+  bluetoothAvailable?: () => boolean
+  /** The connected CycloWatt board, so the chooser can reject it. */
   boardDeviceId: () => string | null
   now: () => number
   setTimer: (fn: () => void, ms: number) => unknown
@@ -118,6 +185,7 @@ export class TrainerController {
   private started = false
   private hasControl = false
   private connected = false
+  private connecting = false
   private deviceName = ""
   private capabilities: FtmsCapabilities | null = null
   private error = ""
@@ -129,17 +197,57 @@ export class TrainerController {
    * the trainer still held the old one.
    */
   private manualTargetSent: ManualTargetSent = null
+  private manualTargetW = DEFAULT_MANUAL_TARGET_W
+  private manualResistancePct = DEFAULT_MANUAL_RESISTANCE_PCT
   private runner: RunnerState = createRunner({ name: "", steps: [] })
   /** True across startProtocol's awaits, so a double click cannot mint two runners. */
   private starting = false
   private steps: ProtocolStep[] = [{ targetWatts: 150, durationSeconds: 300 }]
   private protocolName = ""
   private log: SessionLog | null = null
+  private recording = false
+  private sampleCount = 0
+
+  /**
+   * The device the `gattserverdisconnected` listener is attached to.
+   *
+   * A BluetoothDevice outlives the panel - the browser keeps it for the life of
+   * the grant - so `dispose()` MUST detach the listener from it. The panel used
+   * to hold this twice (a `device` state for the buttons and a `deviceRef` for
+   * that closure); one field is both.
+   */
+  private device: TrainerDevice | null = null
+
+  /** The newest reading; `live` is the throttled one the panel renders. */
+  private liveLatest: LiveSample | null = null
+  private live: LiveSample | null = null
+  private readonly chartBuffer: TrainerChartPoint[] = []
+  private chartData: TrainerChartPoint[] = []
+  /** t=0 of the chart's x axis: the first notification of the session. */
+  private chartStartMs: number | null = null
+  private trainerReportedTargetW: number | null = null
+  private nowTick = 0
+
+  /** The single shared manual debounce; both sub-modes use it (only one target is ever live). */
+  private manualTimer: unknown = null
+  private readonly throttle: { queue(): void; cancel(): void }
 
   private snap: TrainerSnapshot
   private readonly listeners = new Set<() => void>()
 
   constructor(private readonly deps: TrainerControllerDeps) {
+    /*
+     * Leading + trailing, as page.tsx's queueSerialDisplayUpdate: immediate when
+     * the display is stale, else one deferred flush so a burst's final value is
+     * never lost.
+     */
+    this.throttle = createThrottle({
+      intervalMs: DISPLAY_FLUSH_MS,
+      now: deps.now,
+      setTimer: deps.setTimer,
+      clearTimer: deps.clearTimer,
+      onFlush: (nowMs) => this.flushDisplay(nowMs),
+    })
     this.snap = this.buildSnapshot()
   }
 
@@ -156,19 +264,43 @@ export class TrainerController {
     }
   }
 
+  /**
+   * The in-memory log, read-only.
+   *
+   * Nothing in the UI reads it - the Recording card renders `sampleCount` /
+   * `hasLog` from the snapshot and exports through `csvForExport()`. It is
+   * public so the ordered ROW STREAM, the thing this refactor has to preserve
+   * row for row, is assertable in lib/trainer/controller.test.ts.
+   */
+  get sessionLog(): SessionLog | null {
+    return this.log
+  }
+
   private buildSnapshot(): TrainerSnapshot {
     return {
       connected: this.connected,
+      connecting: this.connecting,
+      hasDevice: this.device !== null,
       deviceName: this.deviceName,
       capabilities: this.capabilities,
       hasControl: this.hasControl,
       error: this.error,
       mode: this.mode,
       manualTargetSent: this.manualTargetSent,
+      manualTargetW: this.manualTargetW,
+      manualResistancePct: this.manualResistancePct,
       runner: this.runner,
       starting: this.starting,
       steps: this.steps,
       protocolName: this.protocolName,
+      recording: this.recording,
+      hasLog: this.log !== null,
+      logStartedAtMs: this.log?.startedAtMs ?? null,
+      sampleCount: this.sampleCount,
+      live: this.live,
+      chartData: this.chartData,
+      trainerReportedTargetW: this.trainerReportedTargetW,
+      nowTick: this.nowTick,
     }
   }
 
@@ -193,7 +325,7 @@ export class TrainerController {
    * recording (until Clear or a new session), and a disconnect or a refused
    * control op after the samples stop is still worth a row in the file.
    */
-  logEvent(event: LogEventKind, detail: string, atMs: number = this.deps.now()): void {
+  private logEvent(event: LogEventKind, detail: string, atMs: number = this.deps.now()): void {
     const log = this.log
     if (!log) return
     appendEvent(log, {
@@ -207,25 +339,10 @@ export class TrainerController {
     })
   }
 
-  /** The panel's own error line; the connect flows and the preset editor still write to it. */
+  /** The panel's own error line; the preset editor still writes to it. */
   setError(text: string): void {
     this.error = text
     this.emit()
-  }
-
-  /**
-   * The session log, while the panel still owns the recording buttons.
-   *
-   * Task 8 moves start/stop/clear/export in here and makes this private; until
-   * then `logEvent` needs the log and the Recording card needs to create it, so
-   * exactly one accessor spans the seam.
-   */
-  get _task8Log(): SessionLog | null {
-    return this.log
-  }
-
-  set _task8Log(log: SessionLog | null) {
-    this.log = log
   }
 
   /* ---------------------------------------------------- control-point layer */
@@ -236,7 +353,7 @@ export class TrainerController {
   }
 
   /** See manualTargetSent: the readout must not claim a target the trainer never got. */
-  markManualTargetSent(value: ManualTargetSent): void {
+  private markManualTargetSent(value: ManualTargetSent): void {
     this.manualTargetSent = value
     this.emit()
   }
@@ -328,19 +445,118 @@ export class TrainerController {
     if (await this.sendControl("Request Control", () => session.requestControl())) this.markControl(true)
   }
 
-  /* ------------------------------------------------------- session handover */
+  /* --------------------------------------------------- connect / disconnect */
 
   /**
-   * Adopt a freshly opened session: what the panel's `openSession` did once
-   * `openFtmsSession` had returned, minus the device listener wiring (the panel
-   * still owns the BluetoothDevice, so it still adds and removes that).
+   * Pick a trainer and open a session on it.
    *
-   * Task 8 folds this into `connect()`/`reconnect()`.
+   * WHY ITS OWN CHOOSER. Chrome binds the set of reachable GATT services to the
+   * grant made at requestDevice() time, so a device picked in the board chooser
+   * can never be asked for FTMS afterwards - the grant trap that also shapes
+   * connectReferencePowerMeter in app/page.tsx. The trainer therefore gets its
+   * own requestDevice call, declaring every service it might ever read
+   * (FTMS_OPTIONAL_SERVICES), with a two-layer board guard: exclusionFilters to
+   * keep our own boards out of the list a human sees, plus a post-pick name/id
+   * check because Web Bluetooth filters are OR-ed and cannot express "this
+   * service but not that name".
    */
-  async attachSession(session: TrainerSession, deviceName: string): Promise<void> {
+  async connect(): Promise<void> {
+    if (this.deps.bluetoothAvailable && !this.deps.bluetoothAvailable()) {
+      this.setError("Web Bluetooth API is not supported in this browser.")
+      return
+    }
+
+    this.connecting = true
+    this.error = ""
+    this.emit()
+    try {
+      const requestOptions: RequestDeviceOptions = {
+        filters: [{ services: [FTMS_SERVICE_UUID] }],
+        optionalServices: [...FTMS_OPTIONAL_SERVICES],
+      }
+      // .catch, not try/catch, so the whole flow below has one const binding
+      // whichever chooser produced it (as connectReferencePowerMeter does).
+      const candidate = await this.deps
+        .requestDevice({
+          ...requestOptions,
+          exclusionFilters: BOARD_NAME_PREFIXES.map((namePrefix) => ({ namePrefix })),
+        } as RequestDeviceOptions)
+        .catch((err: unknown) => {
+          // A cancelled chooser is a DOMException and must keep propagating. Only
+          // an engine that does not understand exclusionFilters throws TypeError,
+          // and it gets a second, plain chooser rather than a dead button.
+          if (!(err instanceof TypeError)) throw err
+          this.deps.log?.warn("exclusionFilters unsupported here; relying on the post-pick check")
+          return this.deps.requestDevice(requestOptions)
+        })
+
+      // Reject before connecting, so no trainer state is ever touched by one of
+      // ours. The id check catches the same board under a name the prefix list
+      // does not know.
+      const boardId = this.deps.boardDeviceId()
+      if (isBoardName(candidate.name) || (candidate.id && candidate.id === boardId)) {
+        this.setError(
+          `${candidate.name || "That device"} is a CycloWatt board, not a trainer. ` +
+            "Pick the Kickr (or another FTMS trainer) here - a CycloWatt board connects " +
+            "with the sensor connection on the Data Streaming tab.",
+        )
+        this.deps.log?.warn("Rejected a CycloWatt board picked as the trainer")
+        return
+      }
+
+      await this.openSession(candidate)
+    } catch (err) {
+      this.deps.log?.error("Trainer connection failed:", err)
+      this.setError(`Trainer connection failed: ${errorText(err)}`)
+    } finally {
+      this.connecting = false
+      this.emit()
+    }
+  }
+
+  /** Re-open on the device we already have a grant for - no chooser, so no new grant. */
+  async reconnect(): Promise<void> {
+    const device = this.device
+    if (!device) return
+    this.connecting = true
+    this.error = ""
+    this.emit()
+    try {
+      await this.openSession(device)
+      await this.restoreTargetAfterReconnect()
+    } catch (err) {
+      this.deps.log?.error("Trainer reconnect failed:", err)
+      this.setError(`Trainer reconnect failed: ${errorText(err)}`)
+    } finally {
+      this.connecting = false
+      this.emit()
+    }
+  }
+
+  /**
+   * Open a session on `target` and adopt it.
+   *
+   * The drop listener is wired just BEFORE the session is adopted (rather than
+   * in the middle, where the console line used to sit) so it is already
+   * attached across the opening Request Control's round trip. Remove first: a
+   * reconnect on the same device would otherwise stack a second listener, and
+   * every later drop would run the handler twice.
+   */
+  private async openSession(target: TrainerDevice): Promise<void> {
+    const session = await this.deps.openSession(target, {
+      onBikeData: (data, receivedAtMs) => this.handleBikeData(data, receivedAtMs),
+      onStatus: (status) => this.handleStatus(status),
+      onControlLost: () => this.onControlLost(),
+    })
+
+    this.device = target
+    this.trainerReportedTargetW = null
+    target.removeEventListener("gattserverdisconnected", this.onGattDisconnected)
+    target.addEventListener("gattserverdisconnected", this.onGattDisconnected)
+
     this.session = session
     this.capabilities = session.capabilities
-    this.deviceName = deviceName
+    this.deviceName = target.name || "Trainer"
     this.connected = true
     this.started = false
     this.hasControl = false
@@ -363,63 +579,112 @@ export class TrainerController {
       resistanceWireCeilingTenths: Math.min(caps.resistanceRange.max, 0xff),
     })
 
-    this.logEvent("connected", deviceName)
+    this.logEvent("connected", this.deviceName)
 
     if (await this.sendControl("Request Control", () => session.requestControl())) this.markControl(true)
   }
 
   /**
-   * The link went away on its own (`gattserverdisconnected`): forget the session
-   * and stop claiming a live link, a started trainer or a manual target.
-   *
-   * The dispose is deliberately not awaited - it is talking to a link that has
-   * already gone. `deviceName`, the capabilities, the log and the chart are all
-   * kept, so Reconnect and Export still work. Task 8 folds this into
-   * `onLinkLost()`, together with the rows that follow it.
+   * Put the trainer back where the panel thinks it is after a re-opened link:
+   * it has forgotten every target, and 0x07 has to precede them all
+   * (ensureStarted).
    */
-  detachSession(): void {
-    void this.session?.dispose()
-    this.session = null
-    this.connected = false
-    this.hasControl = false
-    this.started = false
-    this.manualTargetSent = null
-    this.emit()
+  private async restoreTargetAfterReconnect(): Promise<void> {
+    const session = this.session
+    if (!session) return
+    const target = this.mode === "protocol" ? protocolTargetW(this.runner, this.deps.now()) : null
+    if (target !== null) {
+      if (!(await this.ensureStarted())) return
+      const watts = target
+      if (await this.sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))) {
+        this.logEvent("target-set", `${watts} W (re-sent after reconnect)`)
+      }
+    } else if (this.mode === "manual-power") {
+      await this.sendManualPower(this.manualTargetW)
+    } else if (this.mode === "manual-resistance") {
+      await this.sendManualResistance(this.manualResistancePct)
+    }
   }
 
   /**
    * The operator pressed Disconnect: tear the session down and wait for it, so
-   * the panel's `gatt.disconnect()` follows a clean unsubscribe.
+   * the `gatt.disconnect()` that follows lands on a clean unsubscribe.
    *
-   * Nothing snapshot-visible changes here - `connected` stays true until
-   * `clearConnection()`, exactly as the panel's state did, because the rows
-   * written in between must keep their order. Task 8 folds both into
-   * `disconnect()`.
+   * `session = null` AFTER the await here, unlike the two teardown paths below:
+   * that is what the panel's separate setStates did, and the rows written after
+   * it must still be written while `connected` is true - hence the clearing at
+   * the end rather than up front. No BLE writes: the session is already gone.
+   * The log and the chart are kept, so Export still works.
    */
-  async disposeSession(): Promise<void> {
+  async disconnect(): Promise<void> {
+    const target = this.device
+    target?.removeEventListener("gattserverdisconnected", this.onGattDisconnected)
     await this.session?.dispose()
     this.session = null
-  }
+    try {
+      if (target?.gatt?.connected) target.gatt.disconnect()
+    } catch (err) {
+      this.deps.log?.warn("Trainer disconnect: gatt.disconnect() failed", err)
+    }
 
-  /** The state clearing that ends an operator disconnect: no device, no capabilities, no control. */
-  clearConnection(): void {
+    const nowMs = this.deps.now()
+    // A runner left running with no session keeps ticking step boundaries and
+    // logging step-started rows for targets nothing can receive.
+    this.pauseWithoutSending(nowMs)
+    this.logEvent("disconnected", "disconnected by the operator", nowMs)
+
     this.connected = false
     this.hasControl = false
     this.started = false
     this.manualTargetSent = null
     this.deviceName = ""
     this.capabilities = null
+    this.device = null
+    this.trainerReportedTargetW = null
     this.emit()
+  }
+
+  /**
+   * One stable listener for the controller's whole life - add/removeEventListener
+   * must see the same reference.
+   */
+  private readonly onGattDisconnected = (): void => {
+    this.onLinkLost()
+  }
+
+  /**
+   * The link went away on its own (`gattserverdisconnected`): forget the session
+   * and stop claiming a live link, a started trainer or a manual target.
+   *
+   * `session = null` FIRST, then the un-awaited dispose: the dispose is talking
+   * to a link that has already gone, so it may take a while or reject, and a
+   * notification landing in the meantime must not find a session and drive a
+   * write into it. `deviceName`, the capabilities, the log and the chart are all
+   * kept, so Reconnect and Export still work.
+   */
+  private onLinkLost(): void {
+    const session = this.session
+    this.session = null
+    void session?.dispose()
+    this.connected = false
+    this.hasControl = false
+    this.started = false
+    this.manualTargetSent = null
+    this.emit()
+
+    const nowMs = this.deps.now()
+    this.pauseWithoutSending(nowMs)
+    this.logEvent("disconnected", "link lost", nowMs)
   }
 
   /**
    * The trainer revoked control (another app took it).
    *
-   * Fired by the session AFTER its `onStatus`, so the `status` row the panel
+   * Fired by the session AFTER its `onStatus`, so the `status` row handleStatus
    * writes always precedes these. No writes: control is gone, and asking a
    * trainer that just refused us to pause would only queue another refusal.
    */
-  onControlLost(): void {
+  private onControlLost(): void {
     this.markControl(false)
     this.started = false
     // Whatever manual target we set is no longer ours to claim - the trainer is
@@ -437,11 +702,30 @@ export class TrainerController {
    * nothing can receive, but no BLE write may be queued behind a dead Control
    * Point. A no-op unless the runner is actually running.
    */
-  pauseWithoutSending(nowMs: number): void {
+  private pauseWithoutSending(nowMs: number): void {
     if (this.runner.status !== "running") return
     const { state, events } = reduceRunner(this.runner, { type: "pause" }, nowMs)
     this.commitRunner(state)
     this.applyEvents(events, nowMs, { send: false })
+  }
+
+  /**
+   * The panel is unmounting: let go of everything that outlives it.
+   *
+   * The listener goes through `this.device`, not a render closure, because a
+   * BluetoothDevice outlives the component - left attached, it would fire into a
+   * dead panel on every later drop. `session = null` before the un-awaited
+   * dispose, as in onLinkLost. No row and no write: an unmount is not an
+   * operator disconnect.
+   */
+  dispose(): void {
+    this.device?.removeEventListener("gattserverdisconnected", this.onGattDisconnected)
+    this.device = null
+    const session = this.session
+    this.session = null
+    void session?.dispose()
+    this.throttle.cancel()
+    this.clearManualTimer()
   }
 
   /* --------------------------------------------------------- runner layer */
@@ -453,17 +737,6 @@ export class TrainerController {
 
   setProtocolName(name: string): void {
     this.protocolName = name
-    this.emit()
-  }
-
-  /**
-   * The mode the panel's `changeMode` just chose. Only the field write: the
-   * pending-debounce drop, the `manualTargetSent` clear and the target that a
-   * switch into a manual sub-mode writes all still live in the panel, which
-   * Task 8 moves in as `changeMode`.
-   */
-  _task8SetMode(mode: TrainerMode): void {
-    this.mode = mode
     this.emit()
   }
 
@@ -614,7 +887,73 @@ export class TrainerController {
 
   /* ---------------------------------------------------------- manual targets */
 
-  async sendManualPower(watts: number): Promise<void> {
+  /**
+   * Switch mode (or manual sub-mode) and put the TRAINER where the panel now
+   * claims it is.
+   *
+   * A bare mode write was a lie waiting to be recorded: the readout and every
+   * sample would show the new mode's target immediately while the trainer still
+   * held the previous one - Set Target Power and Set Target Resistance Level are
+   * different ops and only one target is live at a time. So a switch into either
+   * manual sub-mode writes that sub-mode's current target straight away, and a
+   * switch into protocol mode writes nothing (there is no protocol target until
+   * the runner starts, and protocolTargetW reports null until then).
+   *
+   * Any pending manual debounce is dropped first: it belongs to the sub-mode
+   * being left, and letting it fire would set that target after the switch.
+   */
+  changeMode(next: TrainerMode): void {
+    if (next === this.mode) return
+    this.clearManualTimer()
+    this.manualTargetSent = null
+    // The field is written straight away, so the very next notification records
+    // the mode the operator just chose - what modeRef did.
+    this.mode = next
+    this.emit()
+
+    if (!this.connected) return // nothing to sync, and the null flag keeps the readout at "–"
+    if (next === "manual-power") void this.sendManualPower(this.manualTargetW)
+    else if (next === "manual-resistance") void this.sendManualResistance(this.manualResistancePct)
+  }
+
+  setManualTargetW(watts: number): void {
+    this.manualTargetW = watts
+    this.emit()
+    if (this.connected && this.mode === "manual-power") {
+      this.queueManualSend(() => this.sendManualPower(watts))
+    }
+  }
+
+  setManualResistancePct(pct: number): void {
+    this.manualResistancePct = pct
+    this.emit()
+    if (this.connected && this.mode === "manual-resistance") {
+      this.queueManualSend(() => this.sendManualResistance(pct))
+    }
+  }
+
+  private clearManualTimer(): void {
+    if (this.manualTimer === null) return
+    this.deps.clearTimer(this.manualTimer)
+    this.manualTimer = null
+  }
+
+  /**
+   * Coalesce a burst of manual edits into one write.
+   *
+   * A slider drag or a held ±button produces edits far faster than a 5 s-timeout
+   * Control Point queue should be fed; both sub-modes share the timer because
+   * only one manual target is ever live on the trainer.
+   */
+  private queueManualSend(run: () => Promise<void>): void {
+    this.clearManualTimer()
+    this.manualTimer = this.deps.setTimer(() => {
+      this.manualTimer = null
+      void run()
+    }, MANUAL_DEBOUNCE_MS)
+  }
+
+  private async sendManualPower(watts: number): Promise<void> {
     const session = this.session
     if (!session) return
     if (!(await this.ensureStarted())) return
@@ -624,7 +963,7 @@ export class TrainerController {
     }
   }
 
-  async sendManualResistance(pct: number): Promise<void> {
+  private async sendManualResistance(pct: number): Promise<void> {
     const session = this.session
     if (!session) return
     if (!(await this.ensureStarted())) return
@@ -635,28 +974,151 @@ export class TrainerController {
     }
   }
 
+  /* -------------------------------------------------------- notifications */
+
   /**
-   * Put the trainer back where the panel thinks it is after a re-opened link:
-   * it has forgotten every target, and 0x07 has to precede them all
-   * (ensureStarted).
+   * One Indoor Bike Data notification: the whole hot path.
    *
-   * The two manual values are parameters because the panel still owns those
-   * sliders; Task 8 folds this whole method into `reconnect()`.
+   * Everything read here is a FIELD, never a rendered value - the closure the
+   * session holds was captured once, at connect time. The sample is appended
+   * BEFORE the tick, so a notification that arrives across a step boundary is
+   * recorded against the step that is ending rather than the one the tick is
+   * about to start. No setState of any kind: the display goes through the
+   * throttle.
    */
-  async restoreTargetAfterReconnect(manualTargetW: number, manualResistancePct: number): Promise<void> {
-    const session = this.session
-    if (!session) return
-    const target = this.mode === "protocol" ? protocolTargetW(this.runner, this.deps.now()) : null
-    if (target !== null) {
-      if (!(await this.ensureStarted())) return
-      const watts = target
-      if (await this.sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))) {
-        this.logEvent("target-set", `${watts} W (re-sent after reconnect)`)
-      }
-    } else if (this.mode === "manual-power") {
-      await this.sendManualPower(manualTargetW)
-    } else if (this.mode === "manual-resistance") {
-      await this.sendManualResistance(manualResistancePct)
+  private handleBikeData(data: IndoorBikeData, nowMs: number): void {
+    this.liveLatest = {
+      powerW: data.powerW,
+      cadenceRpm: data.cadenceRpm,
+      speedKmh: data.speedKmh,
+      hrBpm: data.heartRateBpm,
+      receivedAtMs: nowMs,
+    }
+
+    if (this.chartStartMs === null) this.chartStartMs = nowMs
+    // manual-power only counts once its target has actually been written - see
+    // manualTargetSent. Until then this row records no target, because there
+    // isn't one this panel put on the wire.
+    const targetW =
+      this.mode === "protocol"
+        ? protocolTargetW(this.runner, nowMs)
+        : this.mode === "manual-power" && this.manualTargetSent === "power"
+          ? this.manualTargetW
+          : null
+
+    appendChartPoint(this.chartBuffer, {
+      t: (nowMs - this.chartStartMs) / 1000,
+      power: data.powerW,
+      target: targetW,
+      cadence: data.cadenceRpm,
+    })
+
+    const log = this.log
+    if (this.recording && log) {
+      appendSample(log, {
+        epochMs: nowMs,
+        elapsedS: (nowMs - log.startedAtMs) / 1000,
+        mode: this.mode,
+        protocolName: logProtocolName(this.mode, this.protocolName),
+        stepIndex: logStepIndex(this.mode, this.runner),
+        stepTargetW: targetW,
+        targetResistancePct:
+          this.mode === "manual-resistance" && this.manualTargetSent === "resistance"
+            ? this.manualResistancePct
+            : null,
+        powerW: data.powerW,
+        cadenceRpm: data.cadenceRpm,
+        speedKmh: data.speedKmh,
+        hrBpm: data.heartRateBpm,
+      })
+      // sampleCount is refreshed from the log on the throttled flush, not here:
+      // one publish per notification is exactly what the throttle exists to avoid.
+    }
+
+    this.tick(nowMs)
+    this.throttle.queue()
+  }
+
+  /** Every status the trainer volunteers goes in the log verbatim; one of them is also rendered. */
+  private handleStatus(status: FtmsStatus): void {
+    this.logEvent("status", JSON.stringify(status))
+    if (status.kind === "targetPowerChanged") {
+      // Unthrottled: it is one notification per operator action, not per second.
+      this.trainerReportedTargetW = status.watts
+      this.emit()
+    }
+  }
+
+  /** Publish the throttled display state - one object for all four values. */
+  private flushDisplay(nowMs: number): void {
+    this.live = this.liveLatest
+    // A NEW array every flush: TrainerChart is memo'd and compares identity.
+    this.chartData = [...this.chartBuffer]
+    this.sampleCount = this.log?.samples.length ?? 0
+    this.nowTick = nowMs
+    this.emit()
+  }
+
+  /**
+   * The panel's 1 s re-render clock, so `stale` and the elapsed labels move on
+   * their own between notifications. The interval that drives it stays in the
+   * panel (it is gated on rendered state); the value lives here because the
+   * display flush sets it too.
+   */
+  setNowTick(nowMs: number): void {
+    this.nowTick = nowMs
+    this.emit()
+  }
+
+  /* -------------------------------------------------------------- recording */
+
+  startRecording(): void {
+    const startedAtMs = this.deps.now()
+    const log = createSessionLog(startedAtMs)
+    this.log = log
+    this.recording = true
+    this.sampleCount = 0
+    appendEvent(log, {
+      epochMs: startedAtMs,
+      elapsedS: 0,
+      mode: this.mode,
+      protocolName: logProtocolName(this.mode, this.protocolName),
+      stepIndex: null,
+      event: "session-start",
+      detail: this.connected ? `recording started, ${this.deviceName} connected` : "recording started, not connected",
+    })
+    this.emit()
+  }
+
+  stopRecording(): void {
+    this.recording = false
+    this.sampleCount = this.log?.samples.length ?? 0
+    this.emit()
+  }
+
+  /**
+   * Discard the capture. A stopped-but-unexported log blocks Start recording
+   * (the panel's `heldRecording`) rather than being silently discarded by it, so
+   * this is the only way a capture is ever lost.
+   */
+  clearRecording(): void {
+    this.log = null
+    this.sampleCount = 0
+    this.emit()
+  }
+
+  /**
+   * The CSV and the filename for the export, or null when there is nothing to
+   * export. The Blob and the download click stay in the panel - they are DOM.
+   */
+  csvForExport(): { csv: string; filename: string } | null {
+    const log = this.log
+    if (!log || log.samples.length === 0) return null
+    return {
+      csv: sessionLogToCsv(log),
+      // "" for a manual session: sessionLogFilename slugs that to "session" rather
+      // than stamping a protocol name onto a capture that never ran one.
+      filename: sessionLogFilename(this.mode === "protocol" ? this.protocolName : "", log.startedAtMs),
     }
   }
 }
