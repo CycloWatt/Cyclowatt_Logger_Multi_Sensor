@@ -3,37 +3,27 @@
 /**
  * The Trainer tab: drive a Wahoo Kickr (or any FTMS trainer) from the bench -
  * ERG step protocols, manual target power, manual resistance - while recording
- * one CSV that lines up with the Python logger's own capture.
+ * one CSV that lines up with the Python logger's capture (why one file: see
+ * lib/trainer/session-log.ts).
  *
- * app/page.tsx only mounts this component. The four leaf components below it
- * are purely presentational, every byte-level or timing decision lives in
- * lib/ftms/, and ALL the orchestration - the chooser and its board guard, the
- * connect/reconnect/disconnect flows, the notification handlers, the runner, the
- * manual debounce, recording, and what goes in the session log - lives in
- * TrainerController (lib/trainer/controller.ts), bound to React by the single
- * hook below (hooks/use-trainer-controller.ts - construction, the snapshot
- * mirror, teardown, and why each is shaped the way it is). What is left here is
- * the layout and three decisions worth explaining:
+ * A COMPOSITION ROOT, not the trainer's logic. app/page.tsx mounts this alone;
+ * it makes one useTrainerController() call and lays the snapshot out over the
+ * leaf components (chart, readouts, manual controls, step editor) and the
+ * three cards (connection, run, recording) below. Every orchestration decision
+ * - chooser and board guard, connect/reconnect/disconnect, notification
+ * handlers, the runner, manual debounce, recording, the session log - lives in
+ * TrainerController (lib/trainer/controller.ts). The old panel's "ONE
+ * DISCIPLINE" (a notification handler must read the newest value off a ref,
+ * never a render closure) is now a property of that class, not a convention.
  *
- * WHY ITS OWN ERROR LINE. The page's `error` is set and cleared by unrelated
- * board flows (streaming, DFU, calibration), so a trainer failure shown there
- * would vanish the moment somebody touched the sensor connection. This panel
- * keeps its own (`snapshot.error`, written by the controller and by the preset
- * editor below).
- *
- * WHY WALL-CLOCK TICKS. The runner is pure and takes `nowMs`; a hidden tab has
- * its timers throttled or fully suspended, so one tick can arrive minutes late
- * having skipped several step boundaries. So the runner is driven from three
- * sources - the 250 ms interval below, every Indoor Bike Data notification, and
- * `visibilitychange` - and reduceRunner walks every boundary since the last
- * tick. Of the (possibly several) step-started events one tick emits, only the
- * LAST is sent to the trainer.
- *
- * WHY ONE CSV. The whole point of the log is a `merge_asof` against the Python
- * logger's `cw_time`, so samples and operator/protocol events share one file and
- * one `epoch_s` column - and a static-export page cannot fire two downloads from
- * one click anyway. See lib/trainer/session-log.ts; `csvForExport()` hands this
- * file the bytes and the filename, and the Blob dance below is all that is left.
+ * What IS left: three effects, each tied to something only React's
+ * mount/unmount lifecycle can own - presets (localStorage, loaded post-mount
+ * since this page is prerendered in node), the runner tick (interval plus a
+ * visibilitychange listener), and the staleness clock that ages `live`
+ * readings; the Blob dance turning csvForExport()'s bytes into a download; and
+ * this layout. Its own error line exists because the page's `error` is shared
+ * with unrelated board flows (streaming, DFU, calibration) and would vanish on
+ * an unrelated action - this panel keeps its own (`snapshot.error`).
  */
 
 import { useEffect, useState } from "react"
@@ -216,11 +206,6 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   const protocolActive = runner.status === "running" || runner.status === "paused"
   const view = runnerView(runner, nowTick || Date.now())
   const stale = isStale(live?.receivedAtMs ?? null, nowTick)
-  /*
-   * Both of these read "the target this panel has actually put on the wire", not
-   * "the target the current mode would send" - see manualTargetSent. Protocol
-   * mode needs no flag: protocolTargetW is already null until the runner runs.
-   */
   const currentTargetW = liveTargetW({ mode, runner, nowMs: nowTick || Date.now(), manualTargetSent, manualTargetW })
 
   const targetLabelText = targetLabel({ mode, manualTargetSent, manualResistancePct, liveTargetW: currentTargetW })

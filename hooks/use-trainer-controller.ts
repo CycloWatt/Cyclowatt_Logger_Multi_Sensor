@@ -7,7 +7,10 @@
  * connect/reconnect/disconnect flows, the notification handlers, the runner, the
  * manual debounce, recording, the log - lives in lib/trainer/controller.ts,
  * which knows nothing about React. This hook is the whole binding, and it is
- * deliberately the only place that knows how the two are wired:
+ * deliberately the only place that knows how the two are wired. It is also
+ * deliberately LOGIC-FREE: nothing about what the trainer does is decided here,
+ * only how the class above is wired into React's lifecycle. The four choices
+ * below are all about that wiring, never the trainer:
  *
  * WHY A LAZY REF, NOT `useRef(new TrainerController(...))`. That form CONSTRUCTS
  * on every render and throws the extra instances away - each one carrying live

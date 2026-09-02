@@ -16,18 +16,29 @@
  *
  * WHY A SNAPSHOT + subscribe. React still has to render this state. Rather than
  * a dozen setState mirrors, the controller keeps ONE plain object rebuilt on
- * every change (`emit()`) and hands it out through `snapshot`; the panel mirrors
- * it into a single `useState` from a `subscribe` listener. The object is never
- * mutated in place - a memo'd child compares identity - and `emit()` is only
- * ever called from an event handler, a timer or an awaited op, never during
- * render.
+ * every change (`emit()`) and hands it out through `snapshot`; the hook
+ * (hooks/use-trainer-controller.ts) mirrors it into a single `useState` from a
+ * `subscribe` listener. The object is never mutated in place - a memo'd child
+ * compares identity - and `emit()` is only ever called from an event handler, a
+ * timer or an awaited op, never during render.
  *
  * WHY EVERY COLLABORATOR IS INJECTED. `now`, `setTimer`/`clearTimer`,
  * `openSession`, `requestDevice`, `bluetoothAvailable`, `boardDeviceId` and
  * `log` arrive as deps, so a test can drive the clock, the timers and the
  * trainer without a browser. There is no `Date.now()`, `setTimeout`, `console`
  * or `navigator` in this file - the two browser globals the connect flow needs
- * are the panel's closures.
+ * are the hook's closures.
+ *
+ * WHY dispose() ON UNMOUNT, NOT ON MOUNT-ONLY. The controller outlives every
+ * render but not the component: whoever constructs it must tear it down when
+ * the component goes away, so `dispose()` belongs in the cleanup of the SAME
+ * effect that owns the controller's lifetime - never split into a separate
+ * `[]`-only effect. That matters because of StrictMode: React mounts, cleans
+ * up and re-mounts every effect once in development, so a mount-only effect
+ * would call `dispose()` the instant the controller is constructed, before
+ * anything has subscribed to it. Tied to the controller instance instead,
+ * teardown fires only when the real instance goes away - releasing the
+ * BluetoothDevice listener, the FTMS session and the two timers.
  *
  * WHAT IS LEFT IN THE PANEL: the presets card (localStorage, no trainer I/O),
  * the three timer effects that call in here, the Blob download that `csvForExport`
