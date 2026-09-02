@@ -23,13 +23,9 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart"
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, XAxis, YAxis } from "recharts"
 import { mmss } from "@/lib/trainer/format"
+import type { TrainerChartPoint } from "@/lib/trainer/chart-buffer"
 
-export interface TrainerChartPoint {
-  t: number // seconds since chart start
-  power: number | null
-  target: number | null
-  cadence: number | null
-}
+export type { TrainerChartPoint } from "@/lib/trainer/chart-buffer"
 
 const TRAINER_CHART_CONFIG: ChartConfig = {
   power: { label: "Power", color: "hsl(var(--chart-1))" },

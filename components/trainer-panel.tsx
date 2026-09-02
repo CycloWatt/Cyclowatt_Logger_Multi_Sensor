@@ -50,7 +50,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { TrainerChart, type TrainerChartPoint } from "@/components/trainer-chart"
+import { TrainerChart } from "@/components/trainer-chart"
 import { TrainerManualControls } from "@/components/trainer-manual-controls"
 import { TrainerReadouts } from "@/components/trainer-readouts"
 import { TrainerStepEditor } from "@/components/trainer-step-editor"
@@ -65,7 +65,9 @@ import {
   FTMS_SERVICE_UUID,
   type FtmsStatus,
 } from "@/lib/ftms/protocol"
+import { appendChartPoint, type TrainerChartPoint } from "@/lib/trainer/chart-buffer"
 import { planRunnerEffects, type PlannedOp } from "@/lib/trainer/control-plan"
+import { createThrottle } from "@/lib/trainer/display-throttle"
 import { elapsedLabel, isStale, stepLabel, targetLabel } from "@/lib/trainer/labels"
 import { logProtocolName, logStepIndex } from "@/lib/trainer/log-context"
 import { deletePreset, readPresets, savePreset, validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
@@ -104,8 +106,6 @@ const DISPLAY_FLUSH_MS = 250
 const RUNNER_TICK_MS = 250
 /** A slider drag or a held ±button fires far faster than the Control Point should. */
 const MANUAL_DEBOUNCE_MS = 150
-/** ~10 min of trace at 1 Hz; older points fall off the front. */
-const CHART_MAX_POINTS = 600
 
 interface LiveSample {
   powerW: number | null
@@ -190,8 +190,6 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   const chartStartMsRef = useRef<number | null>(null)
   const [trainerReportedTargetW, setTrainerReportedTargetW] = useState<number | null>(null)
 
-  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const lastFlushRef = useRef(0)
   const manualTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   /** Re-render clock, so `stale` and the elapsed labels move on their own. */
   const [nowTick, setNowTick] = useState(() => 0)
@@ -421,8 +419,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
   /* ------------------------------------------------------ display throttling */
 
-  function flushDisplay(): void {
-    lastFlushRef.current = Date.now()
+  function flushDisplayBody(): void {
     setLive(liveRef.current)
     // A NEW array every flush: TrainerChart is memo'd and compares identity.
     setChartData([...chartBufferRef.current])
@@ -432,15 +429,18 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
   /** Leading + trailing throttle, as page.tsx's queueSerialDisplayUpdate: immediate when
    * the display is stale, else one deferred flush so a burst's final value is never lost. */
+  const throttleRef = useRef(
+    createThrottle({
+      intervalMs: DISPLAY_FLUSH_MS,
+      now: Date.now,
+      setTimer: setTimeout,
+      clearTimer: (handle) => clearTimeout(handle as Parameters<typeof clearTimeout>[0]),
+      onFlush: flushDisplayBody,
+    }),
+  )
+
   function queueDisplayUpdate(): void {
-    if (Date.now() - lastFlushRef.current >= DISPLAY_FLUSH_MS) {
-      flushDisplay()
-    } else if (flushTimerRef.current === null) {
-      flushTimerRef.current = setTimeout(() => {
-        flushTimerRef.current = null
-        flushDisplay()
-      }, DISPLAY_FLUSH_MS)
-    }
+    throttleRef.current.queue()
   }
 
   /* -------------------------------------------------------- session handlers */
@@ -466,14 +466,12 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
           ? manualTargetWRef.current
           : null
 
-    const buffer = chartBufferRef.current
-    buffer.push({
+    appendChartPoint(chartBufferRef.current, {
       t: (nowMs - chartStartMsRef.current) / 1000,
       power: data.powerW,
       target: targetW,
       cadence: data.cadenceRpm,
     })
-    if (buffer.length > CHART_MAX_POINTS) buffer.splice(0, buffer.length - CHART_MAX_POINTS)
 
     const log = logRef.current
     if (recordingRef.current && log) {
@@ -989,7 +987,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       deviceRef.current = null
       void sessionRef.current?.dispose()
       sessionRef.current = null
-      if (flushTimerRef.current !== null) clearTimeout(flushTimerRef.current)
+      throttleRef.current.cancel()
       if (manualTimerRef.current !== null) clearTimeout(manualTimerRef.current)
     },
     [onGattDisconnected],
