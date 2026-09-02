@@ -67,6 +67,7 @@ import {
   type FtmsStatus,
   type SupportedRange,
 } from "@/lib/ftms/protocol"
+import { mmss } from "@/lib/trainer/format"
 import { deletePreset, readPresets, savePreset, validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
 import {
   createRunner,
@@ -121,11 +122,6 @@ interface LiveSample {
 }
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error))
-
-function mmss(totalSeconds: number): string {
-  const total = Math.max(0, Math.round(totalSeconds))
-  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`
-}
 
 /**
  * A ref that always holds the newest value of a state variable, for the

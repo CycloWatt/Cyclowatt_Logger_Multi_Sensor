@@ -22,6 +22,7 @@ import { memo } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart"
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, XAxis, YAxis } from "recharts"
+import { mmss } from "@/lib/trainer/format"
 
 export interface TrainerChartPoint {
   t: number // seconds since chart start
@@ -34,14 +35,6 @@ const TRAINER_CHART_CONFIG: ChartConfig = {
   power: { label: "Power", color: "hsl(var(--chart-1))" },
   target: { label: "Target", color: "hsl(var(--chart-4))" },
   cadence: { label: "Cadence", color: "hsl(var(--chart-2))" },
-}
-
-/** `t` is seconds since chart start; the X axis needs it as mm:ss. */
-function mmss(seconds: number): string {
-  const total = Math.max(0, Math.round(seconds))
-  const m = Math.floor(total / 60)
-  const s = total % 60
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
 }
 
 function TrainerChartImpl({ data }: { data: TrainerChartPoint[] }) {
@@ -60,6 +53,7 @@ function TrainerChartImpl({ data }: { data: TrainerChartPoint[] }) {
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={data} margin={{ top: 10, right: 10, left: 10, bottom: 10 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                {/* `t` is seconds since chart start; the shared mmss renders it as a clock. */}
                 <XAxis dataKey="t" type="number" domain={["dataMin", "dataMax"]} tickFormatter={mmss} />
                 <YAxis yAxisId="w" width={48} unit=" W" />
                 <YAxis yAxisId="rpm" orientation="right" width={56} unit=" rpm" />

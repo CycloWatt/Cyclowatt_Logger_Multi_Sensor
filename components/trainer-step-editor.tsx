@@ -32,6 +32,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import type { SupportedRange } from "@/lib/ftms/protocol"
 import { generateRamp, protocolDurationSeconds, type ProtocolStep } from "@/lib/trainer/protocol-runner"
 import { validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
+import { mmss } from "@/lib/trainer/format"
 
 export interface TrainerStepEditorProps {
   steps: ProtocolStep[]
@@ -45,14 +46,6 @@ export interface TrainerStepEditorProps {
   onDeletePreset: (id: string) => void
   powerRange: SupportedRange
   disabled: boolean // true while a protocol is running/paused
-}
-
-/** Total protocol length as mm:ss - protocolDurationSeconds is already pure seconds. */
-function mmss(totalSeconds: number): string {
-  const total = Math.max(0, Math.round(totalSeconds))
-  const m = Math.floor(total / 60)
-  const s = total % 60
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
 }
 
 const DEFAULT_STEP: ProtocolStep = { targetWatts: 100, durationSeconds: 180 }
