@@ -49,6 +49,8 @@ import { readBenchPrefs, writeBenchPrefs } from "@/lib/bench-prefs"
 import { parseDataPacket as parsePacket, type DataPoint } from "@/lib/raw-stream/packet"
 import { rawCsvFilename, rawStreamToCsv } from "@/lib/raw-stream/csv"
 import { DfuCard } from "@/components/dfu-card"
+import { SerialSyncCard } from "@/components/serial-sync-card"
+import { useSerialSync } from "@/hooks/use-serial-sync"
 import { TrainerPanel } from "@/components/trainer-panel"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 
@@ -268,10 +270,13 @@ export default function BluetoothDataLogger() {
     setCalibrationHistory(readCalibrationHistory())
   }, [])
 
-  const [serialPort, setSerialPort] = useState<SerialPort | null>(null)
-  const [isSerialConnected, setIsSerialConnected] = useState(false)
+  // Web Serial detection stays HERE, in the compatibility effect below, next to
+  // the Bluetooth and secure-context checks it shares an order of console lines
+  // and an error Alert with; the hook is handed the result.
   const [serialSupported, setSerialSupported] = useState<boolean>(true)
-  const [latestSerialValue, setLatestSerialValue] = useState<number>(0)
+  // The serial synchronization input: port, reader loop and throttled display.
+  // `serial.valueRef.current` is what the packet path stamps onto every row.
+  const serial = useSerialSync({ supported: serialSupported, onError: setError, debugLog: DEBUG_PACKET_LOG })
 
   // Reference power meter (standard Cycling Power Service)
   const [refDevice, setRefDevice] = useState<BluetoothDevice | null>(null)
@@ -522,16 +527,6 @@ export default function BluetoothDataLogger() {
   const packetCountRef = useRef<number>(0)
   const lastPacketTimeRef = useRef<number>(Date.now())
 
-  const serialValueRef = useRef<number>(0)
-  // The reader yields decoded STRINGS (it sits behind a TextDecoderStream).
-  const serialReaderRef = useRef<ReadableStreamDefaultReader<string> | null>(null)
-  // Throttle state for the on-screen serial value: the ref above is always
-  // current (every packet logs it), but re-rendering the page per received
-  // line is pointless - the display updates at most ~5x/s, with a trailing
-  // flush so the last value of a burst still lands.
-  const serialFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const lastSerialFlushRef = useRef<number>(0)
-
   const refPowerValueRef = useRef<number>(0)
   const refCharacteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null)
 
@@ -645,115 +640,6 @@ export default function BluetoothDataLogger() {
     })
 
     lastUpdateRef.current = now
-  }
-
-  const connectSerial = async () => {
-    try {
-      if (!("serial" in navigator)) {
-        setError("Web Serial API is not supported in this browser.")
-        return
-      }
-
-      console.log("\n🔌 CONNECTING TO SERIAL PORT...")
-      // Typed since @types/w3c-web-serial - the `as any` escape hatch is gone.
-      const port = await navigator.serial.requestPort()
-      await port.open({ baudRate: 9600 })
-
-      setSerialPort(port)
-      setIsSerialConnected(true)
-      console.log("✅ Serial port connected")
-
-      // Start reading serial data
-      startSerialReading(port)
-    } catch (err) {
-      console.error("Serial connection failed:", err)
-      setError(`Serial connection failed: ${err instanceof Error ? err.message : "Unknown error"}`)
-    }
-  }
-
-  // Leading + trailing throttle: immediate when the display is stale, else one
-  // deferred flush so the final value of a burst is never lost.
-  const queueSerialDisplayUpdate = () => {
-    const now = Date.now()
-    if (now - lastSerialFlushRef.current >= 200) {
-      lastSerialFlushRef.current = now
-      setLatestSerialValue(serialValueRef.current)
-    } else if (serialFlushTimerRef.current === null) {
-      serialFlushTimerRef.current = setTimeout(() => {
-        serialFlushTimerRef.current = null
-        lastSerialFlushRef.current = Date.now()
-        setLatestSerialValue(serialValueRef.current)
-      }, 200)
-    }
-  }
-
-  const startSerialReading = async (port: SerialPort) => {
-    try {
-      const textDecoder = new TextDecoderStream()
-      // The cast bridges two libs' stream generics: w3c-web-serial types the
-      // port as ReadableStream<Uint8Array> while lib.dom types the decoder's
-      // sink as WritableStream<BufferSource>; a Uint8Array IS a BufferSource.
-      const readableStreamClosed = port.readable!.pipeTo(textDecoder.writable as WritableStream<Uint8Array>)
-      const reader = textDecoder.readable.getReader()
-      serialReaderRef.current = reader
-
-      console.log("📡 Starting serial data reading...")
-
-      // Read data continuously
-      while (true) {
-        const { value, done } = await reader.read()
-        if (done) {
-          console.log("📡 Serial reader closed")
-          break
-        }
-
-        if (value) {
-          // Parse the incoming value as a number
-          const trimmedValue = value.trim()
-          const numValue = Number.parseFloat(trimmedValue)
-
-          if (!isNaN(numValue)) {
-            serialValueRef.current = numValue
-            queueSerialDisplayUpdate()
-            // Per-line log at serial line rate - debug only, like the packet log.
-            if (DEBUG_PACKET_LOG) console.log(`Serial data received: ${numValue}`)
-          }
-        }
-      }
-    } catch (err) {
-      console.error("Serial reading error:", err)
-      if (err instanceof Error && err.message.includes("device has been lost")) {
-        setIsSerialConnected(false)
-        setSerialPort(null)
-      }
-    }
-  }
-
-  const disconnectSerial = async () => {
-    try {
-      if (serialReaderRef.current) {
-        await serialReaderRef.current.cancel()
-        serialReaderRef.current = null
-      }
-
-      if (serialPort) {
-        await serialPort.close()
-        setSerialPort(null)
-      }
-
-      setIsSerialConnected(false)
-      serialValueRef.current = 0
-      // Cancel any deferred display flush so it cannot resurrect a stale value
-      // after the zeroing below.
-      if (serialFlushTimerRef.current !== null) {
-        clearTimeout(serialFlushTimerRef.current)
-        serialFlushTimerRef.current = null
-      }
-      setLatestSerialValue(0)
-      console.log("🔌 Serial port disconnected")
-    } catch (err) {
-      console.error("Serial disconnect error:", err)
-    }
   }
 
   // Connect to a reference power meter via the standard Cycling Power Service
@@ -1336,7 +1222,7 @@ export default function BluetoothDataLogger() {
     const dataPoint = parsePacket(dataView, {
       timestamp: labelDate,
       referencePower: refPowerValueRef.current,
-      synchronization: serialValueRef.current,
+      synchronization: serial.valueRef.current,
     })
     if (!dataPoint) return null
 
@@ -1349,7 +1235,7 @@ export default function BluetoothDataLogger() {
         `[${iso}] Force=[${force0}, ${force1}, ${force2}, ${force3}, ${force4}, ${force5}] PowerSlot=${power}`,
       )
       console.log(
-        `[${iso}] Accel=[${accelX}, ${accelY}, ${accelZ}] Gyro=[${gyroX}, ${gyroY}, ${gyroZ}] Sync=${serialValueRef.current}`,
+        `[${iso}] Accel=[${accelX}, ${accelY}, ${accelZ}] Gyro=[${gyroX}, ${gyroY}, ${gyroZ}] Sync=${serial.valueRef.current}`,
       )
     }
 
@@ -1528,7 +1414,7 @@ export default function BluetoothDataLogger() {
                   {isStreaming ? "Streaming Active" : "Streaming Paused"}
                 </Badge>
               )}
-              {isSerialConnected ? (
+              {serial.connected ? (
                 <Badge
                   variant="secondary"
                   className="bg-purple-600 text-white border-purple-500 flex items-center gap-1"
@@ -1589,34 +1475,14 @@ export default function BluetoothDataLogger() {
               data-state class — do not drop it, or both tabs render at once. */}
           <TabsContent value="streaming" forceMount className="mt-4 space-y-6 data-[state=inactive]:hidden">
             {connectionMode === "normal" && (
-              <Card className="bg-white border-gray-200">
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <Cable className="w-5 h-5" />
-                    Serial Synchronization Input
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="flex gap-2 items-center">
-                    {!isSerialConnected ? (
-                      <Button onClick={connectSerial} disabled={!serialSupported || !isSecureContext} variant="outline">
-                        Connect Serial Port
-                      </Button>
-                    ) : (
-                      <Button onClick={disconnectSerial} variant="outline">
-                        Disconnect Serial
-                      </Button>
-                    )}
-                    {isSerialConnected && (
-                      <div className="text-sm text-gray-600 p-3 bg-purple-50 border border-purple-200 rounded-lg">
-                        <div className="font-medium">Serial Port Connected</div>
-                        <div>Latest Value: {latestSerialValue}</div>
-                        <div className="text-xs text-gray-500 mt-1">This value is logged with each Bluetooth data packet</div>
-                      </div>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
+              <SerialSyncCard
+                supported={serialSupported}
+                secure={isSecureContext}
+                connected={serial.connected}
+                latestValue={serial.latestValue}
+                onConnect={serial.connect}
+                onDisconnect={serial.disconnect}
+              />
             )}
 
             {/* Reference Power Meter */}
