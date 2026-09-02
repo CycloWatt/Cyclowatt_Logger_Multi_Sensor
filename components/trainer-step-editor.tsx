@@ -22,7 +22,7 @@
  * confusing than it is useful on a bench.
  */
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -93,6 +93,18 @@ export function TrainerStepEditor({
   const [rawCells, setRawCells] = useState<Partial<Record<CellKey, string>>>({})
   const [rampOpen, setRampOpen] = useState(false)
   const [rampFields, setRampFields] = useState<RampFields>(DEFAULT_RAMP_FIELDS)
+
+  // Internal edits (move/remove/add/generate, below) clear rawCells themselves
+  // before calling onStepsChange, so this looks redundant for THOSE paths -
+  // but `steps` also changes out from under this component whenever the
+  // PARENT swaps it in wholesale (onLoadPreset), and nothing else observes
+  // that. Without this, an in-progress unparsable cell (e.g. "12x") survives
+  // a preset load and keeps shadowing the freshly loaded value in
+  // `cellValue`. `steps` gets a new array identity on every replacement,
+  // internal or external, so keying on it covers both without double logic.
+  useEffect(() => {
+    setRawCells({})
+  }, [steps])
 
   const validationMessage = validateSteps(steps)
   const selectedPreset = presets.find((preset) => preset.id === selectedPresetId) ?? null
