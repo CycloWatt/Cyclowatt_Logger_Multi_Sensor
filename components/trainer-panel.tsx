@@ -66,7 +66,7 @@ import {
   clampToRange,
   type FtmsStatus,
 } from "@/lib/ftms/protocol"
-import { mmss } from "@/lib/trainer/format"
+import { elapsedLabel, isStale, stepLabel, targetLabel } from "@/lib/trainer/labels"
 import { deletePreset, readPresets, savePreset, validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
 import { FINISH_TARGET_W, liveTargetW, protocolTargetW, resistanceTenthsFromPct } from "@/lib/trainer/targets"
 import {
@@ -102,8 +102,6 @@ const DISPLAY_FLUSH_MS = 250
 const RUNNER_TICK_MS = 250
 /** A slider drag or a held ±button fires far faster than the Control Point should. */
 const MANUAL_DEBOUNCE_MS = 150
-/** No notification for this long and every readout greys out. */
-const STALE_MS = 3000
 /** ~10 min of trace at 1 Hz; older points fall off the front. */
 const CHART_MAX_POINTS = 600
 
@@ -1047,7 +1045,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   const heldRecording = !recording && sampleCount > 0
   const protocolActive = runner.status === "running" || runner.status === "paused"
   const view = runnerView(runner, nowTick || Date.now())
-  const stale = live !== null && nowTick - live.receivedAtMs > STALE_MS
+  const stale = isStale(live?.receivedAtMs ?? null, nowTick)
   /*
    * Both of these read "the target this panel has actually put on the wire", not
    * "the target the current mode would send" - see manualTargetSent. Protocol
@@ -1055,26 +1053,17 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
    */
   const currentTargetW = liveTargetW({ mode, runner, nowMs: nowTick || Date.now(), manualTargetSent, manualTargetW })
 
-  const targetLabel =
-    mode === "manual-resistance"
-      ? manualTargetSent === "resistance"
-        ? `${manualResistancePct} %`
-        : "–"
-      : currentTargetW === null
-        ? "–"
-        : `${currentTargetW} W`
-  const stepLabel =
-    mode === "protocol"
-      ? runner.status === "idle"
-        ? "–"
-        : `Step ${view.stepIndex + 1} / ${view.stepCount}`
-      : "Manual"
-  const elapsedLabel =
-    mode === "protocol" && runner.status !== "idle"
-      ? `${mmss(view.totalElapsedS)} / ${mmss(protocolDurationSeconds(runner.protocol))}`
-      : recording && logRef.current
-        ? `${mmss(((nowTick || Date.now()) - logRef.current.startedAtMs) / 1000)} recorded`
-        : "–"
+  const targetLabelText = targetLabel({ mode, manualTargetSent, manualResistancePct, liveTargetW: currentTargetW })
+  const stepLabelText = stepLabel({ mode, runnerStatus: runner.status, stepIndex: view.stepIndex, stepCount: view.stepCount })
+  const elapsedLabelText = elapsedLabel({
+    mode,
+    runnerStatus: runner.status,
+    totalElapsedS: view.totalElapsedS,
+    protocolDurationS: protocolDurationSeconds(runner.protocol),
+    recording,
+    logStartedAtMs: logRef.current?.startedAtMs ?? null,
+    nowMs: nowTick || Date.now(),
+  })
 
   return (
     <>
@@ -1151,9 +1140,9 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       <TrainerReadouts
         powerW={live?.powerW ?? null}
         cadenceRpm={live?.cadenceRpm ?? null}
-        targetLabel={targetLabel}
-        stepLabel={stepLabel}
-        elapsedLabel={elapsedLabel}
+        targetLabel={targetLabelText}
+        stepLabel={stepLabelText}
+        elapsedLabel={elapsedLabelText}
         stale={stale}
         trainerReportedTargetW={trainerReportedTargetW}
       />
