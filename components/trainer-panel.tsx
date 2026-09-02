@@ -67,6 +67,7 @@ import {
   type FtmsStatus,
 } from "@/lib/ftms/protocol"
 import { elapsedLabel, isStale, stepLabel, targetLabel } from "@/lib/trainer/labels"
+import { logProtocolName, logStepIndex } from "@/lib/trainer/log-context"
 import { deletePreset, readPresets, savePreset, validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
 import { FINISH_TARGET_W, liveTargetW, protocolTargetW, resistanceTenthsFromPct } from "@/lib/trainer/targets"
 import {
@@ -203,18 +204,6 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
   /* ---------------------------------------------------------------- logging */
 
-  function logProtocolName(): string {
-    // Blank outside protocol mode: a manual session has no protocol, and a name
-    // left over in those rows would look like one was running.
-    return modeRef.current === "protocol" ? protocolNameRef.current : ""
-  }
-
-  function logStepIndex(): number | null {
-    const state = runnerRef.current
-    if (modeRef.current !== "protocol") return null
-    return state.status === "running" || state.status === "paused" ? state.stepIndex : null
-  }
-
   /**
    * Append one event row, if there is a log to append it to.
    *
@@ -229,8 +218,8 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       epochMs: atMs,
       elapsedS: (atMs - log.startedAtMs) / 1000,
       mode: modeRef.current,
-      protocolName: logProtocolName(),
-      stepIndex: logStepIndex(),
+      protocolName: logProtocolName(modeRef.current, protocolNameRef.current),
+      stepIndex: logStepIndex(modeRef.current, runnerRef.current),
       event,
       detail,
     })
@@ -510,8 +499,8 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         epochMs: nowMs,
         elapsedS: (nowMs - log.startedAtMs) / 1000,
         mode: currentMode,
-        protocolName: logProtocolName(),
-        stepIndex: logStepIndex(),
+        protocolName: logProtocolName(currentMode, protocolNameRef.current),
+        stepIndex: logStepIndex(currentMode, runnerRef.current),
         stepTargetW: targetW,
         targetResistancePct:
           currentMode === "manual-resistance" && manualTargetSentRef.current === "resistance"
@@ -892,7 +881,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
       epochMs: startedAtMs,
       elapsedS: 0,
       mode,
-      protocolName: mode === "protocol" ? protocolName : "",
+      protocolName: logProtocolName(mode, protocolName),
       stepIndex: null,
       event: "session-start",
       detail: connected ? `recording started, ${deviceName} connected` : "recording started, not connected",
