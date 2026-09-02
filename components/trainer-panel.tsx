@@ -185,9 +185,24 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   const [mode, setMode] = useState<TrainerMode>("protocol")
   const [manualTargetW, setManualTargetW] = useState(100)
   const [manualResistancePct, setManualResistancePct] = useState(20)
+  /**
+   * Which manual target has actually been WRITTEN since the last mode change,
+   * or null for none.
+   *
+   * Without this the readout and every recorded sample switch to the new mode's
+   * target the instant a mode button is clicked, while the trainer still holds
+   * the old one - so the CSV's target columns would describe a target that was
+   * never on the wire. Cleared on every mode change and on every disconnect;
+   * state (for the label) mirrored into a ref (for the notification path).
+   */
+  const [manualTargetSent, setManualTargetSent] = useState<ManualSubMode | null>(null)
+  const manualTargetSentRef = useRef<ManualSubMode | null>(null)
 
   const [runner, setRunner] = useState<RunnerState>(() => createRunner({ name: "", steps: [] }))
   const runnerRef = useRef(runner)
+  /** True across startProtocol's awaits, so a double click cannot mint two runners. */
+  const [starting, setStarting] = useState(false)
+  const startingRef = useRef(false)
 
   const [steps, setSteps] = useState<ProtocolStep[]>([{ targetWatts: 150, durationSeconds: 300 }])
   const [protocolName, setProtocolName] = useState("")
@@ -259,6 +274,12 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     setHasControl(value)
   }
 
+  /** See manualTargetSent: ref for the notification path, state for the readout. */
+  function markManualTargetSent(value: ManualSubMode | null): void {
+    manualTargetSentRef.current = value
+    setManualTargetSent(value)
+  }
+
   /**
    * Run one Control Point procedure, log the outcome, and never throw.
    *
@@ -268,9 +289,16 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
    * logged and surfaced but SWALLOWED - a target that did not land must not tear
    * down the runner mid-protocol, leaving the rider with no target at all.
    *
+   * @param options.restartAfterRetake pass false for the 0x08 ops (Stop, Pause):
+   * re-starting the trainer only to stop it again is self-contradictory, and it
+   * would leave startedRef claiming a started trainer that the op then un-starts.
    * @returns true when the trainer acknowledged (first try or retry).
    */
-  async function sendControl(label: string, run: () => Promise<void>): Promise<boolean> {
+  async function sendControl(
+    label: string,
+    run: () => Promise<void>,
+    options: { restartAfterRetake?: boolean } = {},
+  ): Promise<boolean> {
     const session = sessionRef.current
     if (!session) return false
     try {
@@ -282,11 +310,30 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         try {
           await session.requestControl()
           markControl(true)
+          /*
+           * Re-taking control is not enough. Control that was revoked and
+           * re-granted leaves the trainer NOT in the started state, so a target
+           * written straight after the Request Control is ACKNOWLEDGED and then
+           * ignored - and the log would say "success after re-taking control"
+           * about a target that never reached the flywheel. 0x07 first.
+           */
+          const restart = options.restartAfterRetake !== false
+          if (restart) {
+            startedRef.current = false
+            await session.start()
+            startedRef.current = true
+          }
           await run()
-          logEvent("control-result", `${label} -> success after re-taking control`)
+          logEvent(
+            "control-result",
+            `${label} -> success after re-taking control${restart ? " and re-starting" : ""}`,
+          )
           return true
         } catch (retryErr) {
           markControl(false)
+          // The trainer's state is now unknown - the Request Control, the 0x07 or
+          // the op itself failed - so claim nothing about it having been started.
+          startedRef.current = false
           logEvent("control-result", `${label} -> failed after re-taking control: ${errorText(retryErr)}`)
           setError(`${label} failed: ${errorText(retryErr)}`)
           return false
@@ -362,20 +409,38 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     const finishing = events.some((event) => event.type === "finished" || event.type === "stopped")
     if (finishing) {
       /*
-       * Not the last step's target: see FINISH_TARGET_W. Sent even from a paused
-       * runner (Stop while paused), unlike the step targets below: the trainer
-       * acknowledges it either way, and it is what puts the machine at an easy
-       * spin the moment the following Stop releases it. Nothing later would
-       * re-send it, which is exactly why the step-target guard cannot apply here.
+       * Not the last step's target: see FINISH_TARGET_W. Unlike the step targets
+       * below, this one is sent even from a paused runner - Stop while paused -
+       * because nothing later would re-send it and the rider is coasting: landing
+       * on 50 W is the whole intent. But a paused trainer has already had 0x08,
+       * so it applies no target at all; the 0x07 below is what makes the 50 W
+       * actually take effect instead of being acknowledged and dropped.
+       *
+       * Serialised in one async run rather than three fire-and-forget calls, so
+       * the order on the wire is 0x07 -> target -> 0x08 whatever the queue does.
        */
       const watts = clampToRange(FINISH_TARGET_W, session.capabilities.powerRange)
-      void sendControl(`Set Target Power ${watts} W (protocol end)`, () => session.setTargetPower(watts))
-      if (events.some((event) => event.type === "stopped")) {
-        void sendControl("Stop", () => session.stop())
-        // 0x08 puts the trainer back in the state where it honours no ERG target,
-        // so the next run has to send 0x07 again - see ensureStarted.
-        startedRef.current = false
-      }
+      const stopping = events.some((event) => event.type === "stopped")
+      const needsRestart = !startedRef.current
+      /*
+       * 0x08 puts the trainer back in the state where it honours no ERG target,
+       * so the next run has to send 0x07 again (see ensureStarted). Set NOW, not
+       * after the await: a fast Start click must not find a stale `true` while
+       * these writes are still queued.
+       */
+      if (stopping) startedRef.current = false
+      void (async () => {
+        if (needsRestart) {
+          const restarted = await sendControl(
+            "Start or Resume (for the protocol-end target)",
+            () => session.start(),
+          )
+          if (!restarted) return
+          if (!stopping) startedRef.current = true
+        }
+        await sendControl(`Set Target Power ${watts} W (protocol end)`, () => session.setTargetPower(watts))
+        if (stopping) await sendControl("Stop", () => session.stop(), { restartAfterRetake: false })
+      })()
     } else if (runnerRef.current.status !== "paused") {
       /*
        * Only the LAST target of the batch - see WHY WALL-CLOCK TICKS.
@@ -399,7 +464,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     }
 
     if (events.some((event) => event.type === "paused")) {
-      void sendControl("Pause", () => session.pause())
+      void sendControl("Pause", () => session.pause(), { restartAfterRetake: false })
       startedRef.current = false // as for Stop above: Resume must re-send 0x07.
     }
   }
@@ -451,10 +516,13 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
     if (chartStartMsRef.current === null) chartStartMsRef.current = nowMs
     const currentMode = modeRef.current
+    // manual-power only counts once its target has actually been written - see
+    // manualTargetSent. Until then this row records no target, because there
+    // isn't one this panel put on the wire.
     const targetW =
       currentMode === "protocol"
         ? protocolTargetW(runnerRef.current, nowMs)
-        : currentMode === "manual-power"
+        : currentMode === "manual-power" && manualTargetSentRef.current === "power"
           ? manualTargetWRef.current
           : null
 
@@ -476,7 +544,10 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         protocolName: logProtocolName(),
         stepIndex: logStepIndex(),
         stepTargetW: targetW,
-        targetResistancePct: currentMode === "manual-resistance" ? manualResistancePctRef.current : null,
+        targetResistancePct:
+          currentMode === "manual-resistance" && manualTargetSentRef.current === "resistance"
+            ? manualResistancePctRef.current
+            : null,
         powerW: data.powerW,
         cadenceRpm: data.cadenceRpm,
         speedKmh: data.speedKmh,
@@ -500,6 +571,9 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   const handleControlLost = useCallback(() => {
     markControl(false)
     startedRef.current = false
+    // Whatever manual target we set is no longer ours to claim - the trainer is
+    // taking someone else's now.
+    markManualTargetSent(null)
     logEvent("control-lost", "the trainer revoked control")
     const nowMs = Date.now()
     if (runnerRef.current.status === "running") {
@@ -517,6 +591,9 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     setConnected(false)
     markControl(false)
     startedRef.current = false
+    // A dropped link holds no target of ours any more, so the readout must stop
+    // claiming one until something has actually been re-sent.
+    markManualTargetSent(null)
 
     const nowMs = Date.now()
     if (runnerRef.current.status === "running") {
@@ -552,7 +629,24 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     setConnected(true)
     startedRef.current = false
     markControl(false)
+    markManualTargetSent(null)
     setTrainerReportedTargetW(null)
+
+    // One line per connect, so the PR's hardware checklist can be filled in from
+    // the console rather than from a screenshot of the badges. The raw feature
+    // words are the part worth having verbatim: a bit this panel does not read
+    // yet is still visible in them.
+    const caps = session.capabilities
+    console.log("Trainer capabilities", {
+      features: caps.features,
+      rawFeatureWords: caps.features
+        ? `machine=0x${caps.features.raw.machine.toString(16).padStart(8, "0")} ` +
+          `targetSetting=0x${caps.features.raw.targetSetting.toString(16).padStart(8, "0")}`
+        : "unknown - the trainer did not publish 0x2ACC",
+      powerRange: caps.powerRange,
+      resistanceRange: caps.resistanceRange,
+      resistanceWireCeilingTenths: Math.min(caps.resistanceRange.max, 0xff),
+    })
 
     // Remove first: a reconnect on the same device would otherwise stack a second
     // listener, and every later drop would run the handler twice.
@@ -675,6 +769,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     setConnected(false)
     markControl(false)
     startedRef.current = false
+    markManualTargetSent(null)
     setDevice(null)
     setDeviceName("")
     setCapabilities(null)
@@ -689,6 +784,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     if (!(await ensureStarted())) return
     if (await sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))) {
       logEvent("target-set", `${watts} W (manual)`)
+      markManualTargetSent("power")
     }
   }
 
@@ -699,6 +795,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     const tenths = resistanceTenthsFromPct(pct, session.capabilities.resistanceRange)
     if (await sendControl(`Set Target Resistance ${tenths / 10}`, () => session.setTargetResistance(tenths))) {
       logEvent("target-set", `${pct} % -> ${tenths / 10} resistance level (manual)`)
+      markManualTargetSent("resistance")
     }
   }
 
@@ -728,25 +825,75 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   }
 
   function handleSubModeChange(subMode: ManualSubMode): void {
-    setMode(subMode === "power" ? "manual-power" : "manual-resistance")
+    changeMode(subMode === "power" ? "manual-power" : "manual-resistance")
+  }
+
+  /**
+   * Switch mode (or manual sub-mode) and put the TRAINER where the panel now
+   * claims it is.
+   *
+   * A bare setMode was a lie waiting to be recorded: the readout and every
+   * sample would show the new mode's target immediately while the trainer still
+   * held the previous one - Set Target Power and Set Target Resistance Level are
+   * different ops and only one target is live at a time. So a switch into either
+   * manual sub-mode writes that sub-mode's current target straight away, and a
+   * switch into protocol mode writes nothing (there is no protocol target until
+   * the runner starts, and protocolTargetW reports null until then).
+   *
+   * Any pending manual debounce is dropped first: it belongs to the sub-mode
+   * being left, and letting it fire would set that target after the switch.
+   */
+  function changeMode(next: TrainerMode): void {
+    if (next === mode) return
+    if (manualTimerRef.current !== null) {
+      clearTimeout(manualTimerRef.current)
+      manualTimerRef.current = null
+    }
+    markManualTargetSent(null)
+    setMode(next)
+    // Written straight away, not left to useLatestRef's effect: the very next
+    // notification must record the mode the operator just chose.
+    modeRef.current = next
+
+    if (!connected) return // nothing to sync, and the null flag keeps the readout at "–"
+    if (next === "manual-power") void sendManualPower(manualTargetW)
+    else if (next === "manual-resistance") void sendManualResistance(manualResistancePct)
   }
 
   /* --------------------------------------------------------- run  controls */
 
+  /**
+   * Load the edited steps into a fresh runner and start it.
+   *
+   * Re-entrancy matters here: ensureStarted awaits up to two Control Point round
+   * trips (5 s each in the worst case) while the runner is still `idle`, so the
+   * Start button's own `disabled` cannot cover the gap - a second click would
+   * mint a SECOND runner over the first and leave two `start` reductions racing.
+   * The ref is what actually holds the door, since two clicks in one tick would
+   * both see `starting` false.
+   */
   async function startProtocol(): Promise<void> {
+    if (startingRef.current) return
     const problem = validateSteps(steps)
     if (problem !== null) {
       setError(`Cannot start the protocol: ${problem}.`)
       return
     }
     setError("")
-    const fresh = createRunner({ name: protocolName.trim() || "Protocol", steps })
-    commitRunner(fresh)
-    if (!(await ensureStarted())) return
-    const nowMs = Date.now()
-    const { state, events } = reduceRunner(fresh, { type: "start" }, nowMs)
-    commitRunner(state)
-    applyEvents(events, nowMs)
+    startingRef.current = true
+    setStarting(true)
+    try {
+      const fresh = createRunner({ name: protocolName.trim() || "Protocol", steps })
+      commitRunner(fresh)
+      if (!(await ensureStarted())) return
+      const nowMs = Date.now()
+      const { state, events } = reduceRunner(fresh, { type: "start" }, nowMs)
+      commitRunner(state)
+      applyEvents(events, nowMs)
+    } finally {
+      startingRef.current = false
+      setStarting(false)
+    }
   }
 
   function dispatchRunner(action: "pause" | "resume" | "skip" | "stop"): void {
@@ -921,13 +1068,36 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   const ergUnsupported = features !== null && !features.powerTargetSupported
   const resistanceUnsupported = features !== null && !features.resistanceTargetSupported
 
+  /*
+   * A stopped-but-unexported log blocks Start recording rather than being
+   * silently discarded by it - a capture the operator has not saved is the one
+   * thing on this panel that cannot be reproduced by pressing the button again.
+   * The simpler of the two options offered: require Clear, and say why.
+   */
+  const heldRecording = !recording && sampleCount > 0
   const protocolActive = runner.status === "running" || runner.status === "paused"
   const view = runnerView(runner, nowTick || Date.now())
   const stale = live !== null && nowTick - live.receivedAtMs > STALE_MS
-  const liveTargetW = mode === "protocol" ? protocolTargetW(runner, nowTick || Date.now()) : mode === "manual-power" ? manualTargetW : null
+  /*
+   * Both of these read "the target this panel has actually put on the wire", not
+   * "the target the current mode would send" - see manualTargetSent. Protocol
+   * mode needs no flag: protocolTargetW is already null until the runner runs.
+   */
+  const liveTargetW =
+    mode === "protocol"
+      ? protocolTargetW(runner, nowTick || Date.now())
+      : mode === "manual-power" && manualTargetSent === "power"
+        ? manualTargetW
+        : null
 
   const targetLabel =
-    mode === "manual-resistance" ? `${manualResistancePct} %` : liveTargetW === null ? "–" : `${liveTargetW} W`
+    mode === "manual-resistance"
+      ? manualTargetSent === "resistance"
+        ? `${manualResistancePct} %`
+        : "–"
+      : liveTargetW === null
+        ? "–"
+        : `${liveTargetW} W`
   const stepLabel =
     mode === "protocol"
       ? runner.status === "idle"
@@ -1028,7 +1198,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
           size="sm"
           variant={mode === "protocol" ? "default" : "outline"}
           disabled={protocolActive || ergUnsupported}
-          onClick={() => setMode("protocol")}
+          onClick={() => changeMode("protocol")}
         >
           Protocol
         </Button>
@@ -1036,7 +1206,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
           size="sm"
           variant={mode === "protocol" ? "outline" : "default"}
           disabled={protocolActive}
-          onClick={() => setMode("manual-power")}
+          onClick={() => changeMode("manual-power")}
         >
           Manual
         </Button>
@@ -1069,9 +1239,9 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
             <CardContent className="flex flex-wrap items-center gap-2">
               <Button
                 onClick={startProtocol}
-                disabled={!connected || protocolActive || validateSteps(steps) !== null}
+                disabled={!connected || protocolActive || starting || validateSteps(steps) !== null}
               >
-                Start
+                {starting ? "Starting…" : "Start"}
               </Button>
               <Button variant="outline" onClick={() => dispatchRunner("pause")} disabled={runner.status !== "running"}>
                 Pause
@@ -1115,7 +1285,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
           {/* Independent of the runner on purpose: a manual-power or resistance
               session is just as much a bench capture as a protocol run. */}
           <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={startRecording} disabled={recording}>
+            <Button onClick={startRecording} disabled={recording || heldRecording}>
               Start recording
             </Button>
             <Button variant="outline" onClick={stopRecording} disabled={!recording}>
@@ -1132,6 +1302,12 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
               {recording && " · recording"}
             </span>
           </div>
+          {heldRecording && (
+            <p className="text-xs text-amber-600">
+              Clear the previous recording first — starting a new one would discard {sampleCount} unexported
+              samples.
+            </p>
+          )}
           <p className="text-xs text-gray-500">
             epoch_s is this PC&apos;s clock — run the Python logger on the same PC (or NTP-sync both) to correlate.
           </p>
