@@ -38,12 +38,13 @@
 
 import { useEffect, useState } from "react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { TrainerChart } from "@/components/trainer-chart"
+import { TrainerConnectionCard } from "@/components/trainer-connection-card"
 import { TrainerManualControls } from "@/components/trainer-manual-controls"
 import { TrainerReadouts } from "@/components/trainer-readouts"
+import { TrainerRecordingCard } from "@/components/trainer-recording-card"
+import { TrainerRunCard } from "@/components/trainer-run-card"
 import { TrainerStepEditor } from "@/components/trainer-step-editor"
 import { useTrainerController } from "@/hooks/use-trainer-controller"
 import { DEFAULT_POWER_RANGE, DEFAULT_RESISTANCE_RANGE } from "@/lib/ftms/protocol"
@@ -242,69 +243,24 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         </Alert>
       )}
 
-      <Card className="bg-white border-gray-200">
-        <CardHeader>
-          <CardTitle>Trainer connection</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="flex flex-wrap items-center gap-2">
-            {!hasDevice && (
-              <Button onClick={() => void controller.connect()} disabled={!bluetoothAvailable || connecting}>
-                {connecting ? "Connecting…" : "Connect trainer"}
-              </Button>
-            )}
-            {hasDevice && !connected && (
-              <Button onClick={() => void controller.reconnect()} disabled={!bluetoothAvailable || connecting}>
-                {connecting ? "Reconnecting…" : "Reconnect"}
-              </Button>
-            )}
-            {hasDevice && (
-              <Button variant="outline" onClick={() => void controller.disconnect()} disabled={connecting}>
-                Disconnect
-              </Button>
-            )}
-            {connected && !hasControl && (
-              <Button variant="outline" onClick={() => void controller.takeControl()}>
-                Take Control
-              </Button>
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            <span className="font-medium text-gray-900">{deviceName || "No trainer"}</span>
-            <Badge variant={connected ? "default" : "secondary"}>{connected ? "Connected" : "Disconnected"}</Badge>
-            <Badge variant={hasControl ? "default" : "secondary"}>{hasControl ? "Control" : "No control"}</Badge>
-            <Badge variant={ergUnsupported ? "destructive" : "secondary"}>
-              {features === null ? "ERG: unknown" : ergUnsupported ? "ERG unsupported" : "ERG supported"}
-            </Badge>
-            <Badge variant={resistanceUnsupported ? "destructive" : "secondary"}>
-              {features === null
-                ? "Resistance: unknown"
-                : resistanceUnsupported
-                  ? "Resistance unsupported"
-                  : "Resistance supported"}
-            </Badge>
-            {capabilities && (
-              <span className="text-gray-500">
-                power {powerRange.min}–{powerRange.max} W (step {powerRange.increment} W), resistance{" "}
-                {resistanceRange.min / 10}–{Math.min(resistanceRange.max, 0xff) / 10}
-              </span>
-            )}
-          </div>
-
-          {!bluetoothAvailable && (
-            <p className="text-xs text-gray-500">
-              Web Bluetooth needs a supporting browser (Chrome or Edge) over HTTPS or localhost.
-            </p>
-          )}
-          {features === null && connected && (
-            <p className="text-xs text-gray-500">
-              This trainer did not publish its Fitness Machine Feature characteristic, so ERG and resistance
-              support are unknown — both are offered, and the trainer will refuse what it cannot do.
-            </p>
-          )}
-        </CardContent>
-      </Card>
+      <TrainerConnectionCard
+        bluetoothAvailable={bluetoothAvailable}
+        connecting={connecting}
+        hasDevice={hasDevice}
+        connected={connected}
+        hasControl={hasControl}
+        deviceName={deviceName}
+        capabilities={capabilities}
+        powerRange={powerRange}
+        resistanceRange={resistanceRange}
+        features={features}
+        ergUnsupported={ergUnsupported}
+        resistanceUnsupported={resistanceUnsupported}
+        onConnect={() => void controller.connect()}
+        onReconnect={() => void controller.reconnect()}
+        onDisconnect={() => void controller.disconnect()}
+        onTakeControl={() => void controller.takeControl()}
+      />
 
       <TrainerReadouts
         powerW={live?.powerW ?? null}
@@ -355,51 +311,19 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
             powerRange={powerRange}
             disabled={protocolActive}
           />
-          <Card className="bg-white border-gray-200">
-            <CardHeader>
-              <CardTitle>Run</CardTitle>
-            </CardHeader>
-            <CardContent className="flex flex-wrap items-center gap-2">
-              <Button
-                onClick={() => void controller.startProtocol()}
-                disabled={!connected || protocolActive || starting || validateSteps(steps) !== null}
-              >
-                {starting ? "Starting…" : "Start"}
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => controller.dispatchRunner({ type: "pause" })}
-                disabled={runner.status !== "running"}
-              >
-                Pause
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => void controller.resumeProtocol()}
-                disabled={runner.status !== "paused"}
-              >
-                Resume
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => controller.dispatchRunner({ type: "skip" })}
-                disabled={!protocolActive}
-              >
-                Skip step
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => controller.dispatchRunner({ type: "stop" })}
-                disabled={!protocolActive}
-              >
-                Stop
-              </Button>
-              <span className="text-sm text-gray-500">
-                {runner.status}
-                {view.nextStep && runner.status === "running" && ` · next ${view.nextStep.targetWatts} W`}
-              </span>
-            </CardContent>
-          </Card>
+          <TrainerRunCard
+            connected={connected}
+            protocolActive={protocolActive}
+            starting={starting}
+            steps={steps}
+            runnerStatus={runner.status}
+            nextStep={view.nextStep}
+            onStart={() => void controller.startProtocol()}
+            onPause={() => controller.dispatchRunner({ type: "pause" })}
+            onResume={() => void controller.resumeProtocol()}
+            onSkip={() => controller.dispatchRunner({ type: "skip" })}
+            onStop={() => controller.dispatchRunner({ type: "stop" })}
+          />
         </>
       ) : (
         <TrainerManualControls
@@ -416,42 +340,16 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
       <TrainerChart data={chartData} />
 
-      <Card className="bg-white border-gray-200">
-        <CardHeader>
-          <CardTitle>Recording</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {/* Independent of the runner on purpose: a manual-power or resistance
-              session is just as much a bench capture as a protocol run. */}
-          <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={() => controller.startRecording()} disabled={recording || heldRecording}>
-              Start recording
-            </Button>
-            <Button variant="outline" onClick={() => controller.stopRecording()} disabled={!recording}>
-              Stop recording
-            </Button>
-            <Button variant="outline" onClick={exportCsv} disabled={sampleCount === 0}>
-              Export CSV
-            </Button>
-            <Button variant="outline" onClick={() => controller.clearRecording()} disabled={recording || !hasLog}>
-              Clear
-            </Button>
-            <span className="text-sm text-gray-500 tabular-nums">
-              {sampleCount} sample{sampleCount === 1 ? "" : "s"}
-              {recording && " · recording"}
-            </span>
-          </div>
-          {heldRecording && (
-            <p className="text-xs text-amber-600">
-              Clear the previous recording first — starting a new one would discard {sampleCount} unexported
-              samples.
-            </p>
-          )}
-          <p className="text-xs text-gray-500">
-            epoch_s is this PC&apos;s clock — run the Python logger on the same PC (or NTP-sync both) to correlate.
-          </p>
-        </CardContent>
-      </Card>
+      <TrainerRecordingCard
+        recording={recording}
+        heldRecording={heldRecording}
+        sampleCount={sampleCount}
+        hasLog={hasLog}
+        onStartRecording={() => controller.startRecording()}
+        onStopRecording={() => controller.stopRecording()}
+        onExport={exportCsv}
+        onClear={() => controller.clearRecording()}
+      />
     </>
   )
 }
