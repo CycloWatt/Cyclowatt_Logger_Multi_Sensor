@@ -19,6 +19,8 @@
  * visible by the end of it.
  */
 
+import { MAX_STEPS } from "./presets"
+
 export interface ProtocolStep {
   targetWatts: number
   durationSeconds: number
@@ -280,8 +282,12 @@ export interface RampParams {
   stepCount?: number
 }
 
-/** No protocol needs more steps than this, and it keeps a typo'd stepCount from hanging the UI. */
-const MAX_RAMP_STEPS = 200
+/**
+ * One rule, one constant: the same cap validateSteps enforces, so a generated
+ * ramp can never be one step too long to save or start. It also keeps a typo'd
+ * stepCount from hanging the UI.
+ */
+const MAX_RAMP_STEPS = MAX_STEPS
 
 /**
  * A linear ramp: `startWatts`, then `startWatts + incrementWatts`, and so on.

@@ -17,6 +17,8 @@ export interface TrainerRecordingCardProps {
   recording: boolean
   heldRecording: boolean
   sampleCount: number
+  /** Event rows count as exportable content too - see TrainerSnapshot.eventCount. */
+  eventCount: number
   hasLog: boolean
   onStartRecording: () => void
   onStopRecording: () => void
@@ -28,6 +30,7 @@ export function TrainerRecordingCard({
   recording,
   heldRecording,
   sampleCount,
+  eventCount,
   hasLog,
   onStartRecording,
   onStopRecording,
@@ -49,7 +52,7 @@ export function TrainerRecordingCard({
           <Button variant="outline" onClick={onStopRecording} disabled={!recording}>
             Stop recording
           </Button>
-          <Button variant="outline" onClick={onExport} disabled={sampleCount === 0}>
+          <Button variant="outline" onClick={onExport} disabled={sampleCount + eventCount === 0}>
             Export CSV
           </Button>
           <Button variant="outline" onClick={onClear} disabled={recording || !hasLog}>
@@ -62,8 +65,8 @@ export function TrainerRecordingCard({
         </div>
         {heldRecording && (
           <p className="text-xs text-amber-600">
-            Clear the previous recording first — starting a new one would discard {sampleCount} unexported
-            samples.
+            Clear the previous recording first — starting a new one would discard its unexported {sampleCount}{" "}
+            sample{sampleCount === 1 ? "" : "s"} and {eventCount} event{eventCount === 1 ? "" : "s"}.
           </p>
         )}
         <p className="text-xs text-gray-500">

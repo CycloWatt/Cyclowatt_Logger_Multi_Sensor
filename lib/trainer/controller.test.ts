@@ -481,7 +481,7 @@ describe("link lost", () => {
 })
 
 describe("disconnect", () => {
-  it("disposes before dropping the link, then writes the operator's rows", async () => {
+  it("releases the trainer (Stop, Reset), disposes, then drops the link and writes the rows", async () => {
     const h = await connected()
     await h.controller.startProtocol()
     await flush()
@@ -489,10 +489,18 @@ describe("disconnect", () => {
 
     await h.controller.disconnect()
     await flush()
-    // The dispose is AWAITED before gatt.disconnect, so the unsubscribe lands on
-    // a live link; the pause that follows sends nothing (no session any more).
-    expect(h.calls).toEqual(["dispose", "gatt.disconnect"])
-    expect(h.rows().slice(-2)).toEqual(["paused: ", "disconnected: disconnected by the operator"])
+    // The trainer is RELEASED before the teardown: a Kickr left in ERG keeps
+    // holding the last target with no controller attached. The runner's pause
+    // sends nothing (send:false) and precedes the release, so no tick can queue
+    // a fresh target behind the Reset. The dispose is AWAITED before
+    // gatt.disconnect, so the unsubscribe lands on a live link.
+    expect(h.calls).toEqual(["stop", "reset", "dispose", "gatt.disconnect"])
+    expect(h.rows().slice(-4)).toEqual([
+      "paused: ",
+      "control-result: Stop -> success",
+      "control-result: Reset -> success",
+      "disconnected: disconnected by the operator",
+    ])
     const snapshot = h.controller.snapshot
     expect(snapshot.connected).toBe(false)
     expect(snapshot.hasDevice).toBe(false)
@@ -509,6 +517,23 @@ describe("disconnect", () => {
     await h.controller.disconnect()
     await flush()
     expect(h.rows().slice(-1)).toEqual(["disconnected: disconnected by the operator"])
+  })
+
+  it("does not raise the control-lost alarm for its own disconnect Reset", async () => {
+    const h = await connected()
+    // A trainer may answer a client Reset with a control-permission-lost status;
+    // fired mid-release, that is OUR doing, not "another app took it".
+    const originalReset = h.fake.session.reset
+    h.fake.session.reset = () => {
+      h.controlLost()
+      return originalReset()
+    }
+
+    await h.controller.disconnect()
+    await flush()
+
+    expect(h.controller.snapshot.error).toBe("")
+    expect(h.rows().filter((row) => row.startsWith("control-lost"))).toEqual([])
   })
 })
 
@@ -1051,9 +1076,12 @@ describe("recording", () => {
 })
 
 describe("csvForExport", () => {
-  it("is null until there is a sample to export", async () => {
+  it("exports an event-only log, and is null only when no log exists", async () => {
     const h = await connected()
-    expect(h.controller.csvForExport()).toBeNull() // a log, but no samples
+    // A capture with rows but no samples (recording started while disconnected,
+    // a run with no notifications) is still an unreproducible capture: it must
+    // be exportable, not silently unreachable behind a samples-only gate.
+    expect(h.controller.csvForExport()?.csv).toBe(sessionLogToCsv(h.controller.sessionLog!))
     h.controller.clearRecording()
     expect(h.controller.csvForExport()).toBeNull() // no log at all
   })
@@ -1100,8 +1128,12 @@ describe("dispose", () => {
 
     expect(h.pendingTimers()).toEqual([])
     expect(h.dev.listenerCount()).toBe(0)
-    expect(h.calls).toEqual(["dispose"])
-    // Unmount writes no row and sends nothing else.
+    // The same Stop + Reset release as disconnect(), best-effort and BEFORE the
+    // dispose (which would reject anything still queued): an unmounted panel
+    // holds no way to ever change the target again.
+    expect(h.calls).toEqual(["stop", "reset", "dispose"])
+    // Unmount writes no row: the release goes through the session directly, not
+    // through sendControl, so no control-result rows land in a kept log.
     expect(h.rows().length).toBe(before)
     expect(h.controller.snapshot.live).toBe(published)
   })

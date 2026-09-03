@@ -100,6 +100,22 @@ describe("savePreset", () => {
     expect(updated.steps).toEqual([step(210), step(220)])
   })
 
+  it("matches on id when one is given, so a rename keeps one row per id and per name", () => {
+    const store = memoryStore()
+    const first = savePreset({ name: "Sweet spot", steps: [step(200)] }, store)
+    const sweetSpotId = first.find((p) => p.name === "Sweet spot")!.id
+    savePreset({ name: "Openers", steps: [step(300)] }, store)
+
+    // Rename "Sweet spot" (by its id) onto the name "Openers": neither the id
+    // nor the name may end up on two rows, or deletePreset(id) would take both.
+    const list = savePreset({ id: sweetSpotId, name: "Openers", steps: [step(310)] }, store)
+
+    const userPresets = list.filter((p) => !p.builtIn)
+    expect(userPresets).toHaveLength(1)
+    expect(userPresets[0]).toMatchObject({ id: sweetSpotId, name: "Openers", steps: [step(310)] })
+    expect(readPresets(store).filter((p) => p.id === sweetSpotId)).toHaveLength(1)
+  })
+
   it("refuses a name matching a built-in and leaves the store untouched", () => {
     const store = memoryStore()
     const before = store.getItem(PRESET_STORAGE_KEY)

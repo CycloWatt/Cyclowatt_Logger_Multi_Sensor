@@ -142,8 +142,18 @@ export interface SupportedRange {
   increment: number
 }
 
-/** Supported Power Range: int16 min W, int16 max W, uint16 increment W. */
+/**
+ * Supported Power Range: int16 min W, int16 max W, uint16 increment W.
+ *
+ * The explicit length check (here and in the resistance twin below) exists so a
+ * short payload reads as "payload is N bytes, expected 6" in the console, not
+ * as a bare DataView RangeError dressed up as "could not read" - either way the
+ * session's readOptional catches it and falls back to the spec default.
+ */
 export function parseSupportedPowerRange(value: DataView): SupportedRange {
+  if (value.byteLength < 6) {
+    throw new Error(`Supported Power Range is ${value.byteLength} bytes, expected 6`)
+  }
   return {
     min: value.getInt16(0, true),
     max: value.getInt16(2, true),
@@ -157,6 +167,9 @@ export function parseSupportedPowerRange(value: DataView): SupportedRange {
  * so it matches the byte Set Target Resistance Level carries.
  */
 export function parseSupportedResistanceRange(value: DataView): SupportedRange {
+  if (value.byteLength < 6) {
+    throw new Error(`Supported Resistance Level Range is ${value.byteLength} bytes, expected 6`)
+  }
   return {
     min: value.getInt16(0, true),
     max: value.getInt16(2, true),

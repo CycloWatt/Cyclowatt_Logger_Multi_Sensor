@@ -156,6 +156,13 @@ export interface TrainerSnapshot {
   hasLog: boolean
   logStartedAtMs: number | null
   sampleCount: number
+  /**
+   * Event rows, alongside sampleCount: a log can hold events and no samples at
+   * all (recording started while disconnected, a run with no notifications) -
+   * and such a log must still be exportable and still be protected from a
+   * discarding Start.
+   */
+  eventCount: number
   /** The throttled reading, not the newest one - see the display throttle. */
   live: LiveSample | null
   chartData: TrainerChartPoint[]
@@ -197,6 +204,9 @@ export class TrainerController {
   /** Has Start or Resume (0x07) been sent since control was acquired? The Kickr honours ERG targets only after it. */
   private started = false
   private hasControl = false
+  /** True while disconnect() is deliberately Reset-ing control away, so
+   * onControlLost does not read our own release as "another app took it". */
+  private releasingControl = false
   private connected = false
   private connecting = false
   private deviceName = ""
@@ -220,6 +230,7 @@ export class TrainerController {
   private log: SessionLog | null = null
   private recording = false
   private sampleCount = 0
+  private eventCount = 0
 
   /**
    * The device the `gattserverdisconnected` listener is attached to.
@@ -244,6 +255,27 @@ export class TrainerController {
   /** The single shared manual debounce; both sub-modes use it (only one target is ever live). */
   private manualTimer: unknown = null
   private readonly throttle: { queue(): void; cancel(): void }
+
+  /**
+   * Tail of the LOGICAL control-sequence queue.
+   *
+   * FtmsSession serialises individual writes; this serialises multi-write
+   * SEQUENCES (the protocol-end 0x07 -> target -> 0x08 chain, a manual send's
+   * ensure-started + target, the disconnect release). Without it two sequences
+   * interleave in the session's shared queue - a protocol-end coast-down racing
+   * a mode switch could leave the trainer holding 50 W while the readout claims
+   * the manual target. Same `.then(run, run)` shape as FtmsSession.send, for
+   * the same reason: a failed sequence hands the queue to the next one. One
+   * rule keeps it deadlock-free: a queued sequence must never enqueue-and-await
+   * another (they call sendControl/ensureStarted directly instead).
+   */
+  private controlChain: Promise<unknown> = Promise.resolve()
+
+  private queueControlSequence<T>(run: () => Promise<T>): Promise<T> {
+    const next = this.controlChain.then(run, run)
+    this.controlChain = next
+    return next
+  }
 
   private snap: TrainerSnapshot
   private readonly listeners = new Set<() => void>()
@@ -310,6 +342,7 @@ export class TrainerController {
       hasLog: this.log !== null,
       logStartedAtMs: this.log?.startedAtMs ?? null,
       sampleCount: this.sampleCount,
+      eventCount: this.eventCount,
       live: this.live,
       chartData: this.chartData,
       trainerReportedTargetW: this.trainerReportedTargetW,
@@ -350,6 +383,11 @@ export class TrainerController {
       event,
       detail,
     })
+    // Events are step boundaries and control outcomes - a few per minute, not
+    // per notification - so publishing per event stays within the throttle
+    // discipline that keeps sampleCount off the notification path.
+    this.eventCount = log.events.length
+    this.emit()
   }
 
   /** The panel's own error line; the preset editor still writes to it. */
@@ -383,6 +421,8 @@ export class TrainerController {
    * @param options.restartAfterRetake pass false for the 0x08 ops (Stop, Pause):
    * re-starting the trainer only to stop it again is self-contradictory, and it
    * would leave `started` claiming a started trainer that the op then un-starts.
+   * Also false when the op IS 0x07 itself - the retry's own `run()` re-sends it,
+   * and the restart would put a duplicate Start on the wire first.
    * @returns true when the trainer acknowledged (first try or retry).
    */
   private async sendControl(
@@ -445,7 +485,9 @@ export class TrainerController {
       this.markControl(true)
     }
     if (!this.started) {
-      if (!(await this.sendControl("Start or Resume", () => session.start()))) return false
+      if (!(await this.sendControl("Start or Resume", () => session.start(), { restartAfterRetake: false }))) {
+        return false
+      }
       this.started = true
     }
     return true
@@ -607,11 +649,13 @@ export class TrainerController {
     if (!session) return
     const target = this.mode === "protocol" ? protocolTargetW(this.runner, this.deps.now()) : null
     if (target !== null) {
-      if (!(await this.ensureStarted())) return
       const watts = target
-      if (await this.sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))) {
-        this.logEvent("target-set", `${watts} W (re-sent after reconnect)`)
-      }
+      await this.queueControlSequence(async () => {
+        if (!(await this.ensureStarted())) return
+        if (await this.sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))) {
+          this.logEvent("target-set", `${watts} W (re-sent after reconnect)`)
+        }
+      })
     } else if (this.mode === "manual-power") {
       await this.sendManualPower(this.manualTargetW)
     } else if (this.mode === "manual-resistance") {
@@ -620,18 +664,48 @@ export class TrainerController {
   }
 
   /**
-   * The operator pressed Disconnect: tear the session down and wait for it, so
-   * the `gatt.disconnect()` that follows lands on a clean unsubscribe.
+   * The operator pressed Disconnect: release the trainer, tear the session down
+   * and wait for it, so the `gatt.disconnect()` that follows lands on a clean
+   * unsubscribe.
    *
-   * `session = null` AFTER the await here, unlike the two teardown paths below:
-   * that is what the panel's separate setStates did, and the rows written after
-   * it must still be written while `connected` is true - hence the clearing at
-   * the end rather than up front. No BLE writes: the session is already gone.
-   * The log and the chart are kept, so Export still works.
+   * THE RELEASE COMES FIRST. dispose() and gatt.disconnect() end OUR session,
+   * but a Kickr left in ERG keeps holding the last target with no controller
+   * attached until it times out or is power-cycled - "Disconnect" at 350 W must
+   * not leave the rider grinding 350 W. Stop puts the flywheel down; Reset
+   * drops the targets and hands control back. Both best-effort (sendControl
+   * never throws): a trainer that refuses them still gets disconnected. The
+   * runner is paused BEFORE them, or a tick during their await could queue a
+   * fresh step target behind the Reset; the pending manual debounce is dropped
+   * for the same reason.
+   *
+   * `session = null` AFTER the awaits, unlike the two teardown paths below: the
+   * rows written along the way must still be written while `connected` is true
+   * - hence the state clearing at the end rather than up front. The log and the
+   * chart are kept, so Export still works.
    */
   async disconnect(): Promise<void> {
     const target = this.device
     target?.removeEventListener("gattserverdisconnected", this.onGattDisconnected)
+    this.clearManualTimer()
+
+    const nowMs = this.deps.now()
+    // A runner left running with no session keeps ticking step boundaries and
+    // logging step-started rows for targets nothing can receive.
+    this.pauseWithoutSending(nowMs)
+
+    const session = this.session
+    if (session && this.hasControl) {
+      this.releasingControl = true
+      try {
+        await this.queueControlSequence(async () => {
+          await this.sendControl("Stop", () => session.stop(), { restartAfterRetake: false })
+          await this.sendControl("Reset", () => session.reset(), { restartAfterRetake: false })
+        })
+      } finally {
+        this.releasingControl = false
+      }
+    }
+
     await this.session?.dispose()
     this.session = null
     try {
@@ -640,10 +714,6 @@ export class TrainerController {
       this.deps.log?.warn("Trainer disconnect: gatt.disconnect() failed", err)
     }
 
-    const nowMs = this.deps.now()
-    // A runner left running with no session keeps ticking step boundaries and
-    // logging step-started rows for targets nothing can receive.
-    this.pauseWithoutSending(nowMs)
     this.logEvent("disconnected", "disconnected by the operator", nowMs)
 
     this.connected = false
@@ -698,6 +768,9 @@ export class TrainerController {
    * trainer that just refused us to pause would only queue another refusal.
    */
   private onControlLost(): void {
+    // A Reset WE sent on the disconnect path releases control by design; the
+    // "another app took it" alarm below is for everyone else.
+    if (this.releasingControl) return
     this.markControl(false)
     this.started = false
     // Whatever manual target we set is no longer ours to claim - the trainer is
@@ -728,15 +801,29 @@ export class TrainerController {
    * The listener goes through `this.device`, not a render closure, because a
    * BluetoothDevice outlives the component - left attached, it would fire into a
    * dead panel on every later drop. `session = null` before the un-awaited
-   * dispose, as in onLinkLost. No row and no write: an unmount is not an
-   * operator disconnect.
+   * teardown, as in onLinkLost. No row: an unmount is not an operator
+   * disconnect. But the same Stop + Reset release as disconnect(), best-effort:
+   * an unmounted panel holds no way to ever change the target again, so the
+   * trainer must not be left holding the last one. session.dispose() only after
+   * the ops settle - it rejects anything still queued. (In practice unmount is
+   * page teardown - the tab is forceMount - so this is a race the browser may
+   * win; the trainer's own timeout is the backstop.)
    */
   dispose(): void {
     this.device?.removeEventListener("gattserverdisconnected", this.onGattDisconnected)
     this.device = null
     const session = this.session
+    const release = this.hasControl
     this.session = null
-    void session?.dispose()
+    if (session) {
+      void (async () => {
+        if (release) {
+          await session.stop().catch(() => {})
+          await session.reset().catch(() => {})
+        }
+        await session.dispose()
+      })()
+    }
     this.throttle.cancel()
     this.clearManualTimer()
   }
@@ -813,8 +900,9 @@ export class TrainerController {
     if (plan.sequencing === "chain") {
       // The protocol-end ops, serialised in one async run rather than fired as
       // independent calls, so the order on the wire is 0x07 -> target -> 0x08
-      // whatever the queue does - and a failed 0x07 abandons the rest.
-      void (async () => {
+      // whatever the queue does - and a failed 0x07 abandons the rest. Queued
+      // as ONE sequence so no other sender can interleave into the middle.
+      void this.queueControlSequence(async () => {
         for (const op of plan.ops) {
           const acknowledged = await issue(op)
           if (op.kind !== "start") continue
@@ -829,13 +917,16 @@ export class TrainerController {
             this.started = true
           }
         }
-      })()
+      })
       return
     }
 
-    // A step target and a Pause are each fired without awaiting the other one.
+    // A step target and a Pause are each fired without awaiting the other one -
+    // but each still queues as its own sequence entry, so neither can land
+    // INSIDE a multi-op sequence already in flight (a coast-down, a manual
+    // send mid-ensure).
     for (const op of plan.ops) {
-      void issue(op)
+      void this.queueControlSequence(() => issue(op))
       if (op.kind === "pause") this.started = false // as for Stop above: Resume must re-send 0x07.
     }
   }
@@ -877,7 +968,10 @@ export class TrainerController {
     try {
       const fresh = createRunner({ name: this.protocolName.trim() || "Protocol", steps: this.steps })
       this.commitRunner(fresh)
-      if (!(await this.ensureStarted())) return
+      // Queued so a Stop clicked a moment ago finishes its 0x08 before this
+      // sequence's 0x07 - interleaved, the trainer could end up stopped while
+      // the runner runs. The first step's target enqueues right behind it.
+      if (!(await this.queueControlSequence(() => this.ensureStarted()))) return
       const nowMs = this.deps.now()
       const { state, events } = reduceRunner(fresh, { type: "start" }, nowMs)
       this.commitRunner(state)
@@ -904,8 +998,8 @@ export class TrainerController {
 
   async resumeProtocol(): Promise<void> {
     // 0x07 again first: a pause sent 0x08, and the trainer applies no ERG target
-    // until it has been started once more.
-    if (!(await this.ensureStarted())) return
+    // until it has been started once more. Queued as in startProtocol.
+    if (!(await this.queueControlSequence(() => this.ensureStarted()))) return
     this.dispatchRunner({ type: "resume" })
   }
 
@@ -977,25 +1071,33 @@ export class TrainerController {
     }, MANUAL_DEBOUNCE_MS)
   }
 
+  /* Each manual send is one queued sequence (ensure-started plus the target),
+   * so it cannot interleave with a protocol-end coast-down or with the other
+   * sub-mode's send - only whole sequences ever meet on the wire. */
+
   private async sendManualPower(watts: number): Promise<void> {
-    const session = this.session
-    if (!session) return
-    if (!(await this.ensureStarted())) return
-    if (await this.sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))) {
-      this.logEvent("target-set", `${watts} W (manual)`)
-      this.markManualTargetSent("power")
-    }
+    await this.queueControlSequence(async () => {
+      const session = this.session
+      if (!session) return
+      if (!(await this.ensureStarted())) return
+      if (await this.sendControl(`Set Target Power ${watts} W`, () => session.setTargetPower(watts))) {
+        this.logEvent("target-set", `${watts} W (manual)`)
+        this.markManualTargetSent("power")
+      }
+    })
   }
 
   private async sendManualResistance(pct: number): Promise<void> {
-    const session = this.session
-    if (!session) return
-    if (!(await this.ensureStarted())) return
-    const tenths = resistanceTenthsFromPct(pct, session.capabilities.resistanceRange)
-    if (await this.sendControl(`Set Target Resistance ${tenths / 10}`, () => session.setTargetResistance(tenths))) {
-      this.logEvent("target-set", `${pct} % -> ${tenths / 10} resistance level (manual)`)
-      this.markManualTargetSent("resistance")
-    }
+    await this.queueControlSequence(async () => {
+      const session = this.session
+      if (!session) return
+      if (!(await this.ensureStarted())) return
+      const tenths = resistanceTenthsFromPct(pct, session.capabilities.resistanceRange)
+      if (await this.sendControl(`Set Target Resistance ${tenths / 10}`, () => session.setTargetResistance(tenths))) {
+        this.logEvent("target-set", `${pct} % -> ${tenths / 10} resistance level (manual)`)
+        this.markManualTargetSent("resistance")
+      }
+    })
   }
 
   /* -------------------------------------------------------- notifications */
@@ -1102,6 +1204,7 @@ export class TrainerController {
     this.log = log
     this.recording = true
     this.sampleCount = 0
+    this.eventCount = 1 // the session-start row below
     appendEvent(log, {
       epochMs: startedAtMs,
       elapsedS: 0,
@@ -1128,6 +1231,7 @@ export class TrainerController {
   clearRecording(): void {
     this.log = null
     this.sampleCount = 0
+    this.eventCount = 0
     this.emit()
   }
 
@@ -1137,7 +1241,9 @@ export class TrainerController {
    */
   csvForExport(): { csv: string; filename: string } | null {
     const log = this.log
-    if (!log || log.samples.length === 0) return null
+    // Events count as content: a capture that never got a sample (recording
+    // started while disconnected) still holds operator/protocol rows worth a file.
+    if (!log || log.samples.length + log.events.length === 0) return null
     return {
       csv: sessionLogToCsv(log),
       // "" for a manual session: sessionLogFilename slugs that to "session" rather

@@ -1,0 +1,45 @@
+# Lint, unit tests and a production build for every PR and for main.
+#
+# The name "CI" is load-bearing: claude-code-review.yml polls for a workflow
+# with exactly this name on the PR's head commit and reports its conclusion to
+# the reviewer. Rename both together or the review falls back to "no CI ran".
+#
+# pages.yml runs the tests and build again on push to main before deploying;
+# this job is what runs them BEFORE merge, where a red result can still stop one.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push to the same PR supersedes an in-flight run of the old commit.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Not `npm run lint`: that script says `eslint .` but eslint is neither a
+      # devDependency nor configured in this repo, so it fails everywhere. Add
+      # eslint (or `next lint`) properly before adding a lint step here.
+      - run: npm test
+
+      # output: 'export' means a broken page fails the BUILD, not a server at
+      # runtime - so the build is part of CI, not just of the Pages deploy.
+      - run: npm run build

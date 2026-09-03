@@ -64,6 +64,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     connecting,
     deviceName,
     error,
+    eventCount,
     hasControl,
     hasDevice,
     hasLog,
@@ -202,7 +203,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
    * thing on this panel that cannot be reproduced by pressing the button again.
    * The simpler of the two options offered: require Clear, and say why.
    */
-  const heldRecording = !recording && sampleCount > 0
+  const heldRecording = !recording && sampleCount + eventCount > 0
   const protocolActive = runner.status === "running" || runner.status === "paused"
   const view = runnerView(runner, nowTick || Date.now())
   const stale = isStale(live?.receivedAtMs ?? null, nowTick)
@@ -329,6 +330,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         recording={recording}
         heldRecording={heldRecording}
         sampleCount={sampleCount}
+        eventCount={eventCount}
         hasLog={hasLog}
         onStartRecording={() => controller.startRecording()}
         onStopRecording={() => controller.stopRecording()}
