@@ -11,8 +11,14 @@
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "jsx": "preserve",
+    "jsx": "react-jsx",
     "incremental": true,
+    // TypeScript 6+ defaults `types` to [] instead of every @types package, so
+    // the ambient Web Bluetooth / Web Serial globals (BluetoothDevice,
+    // navigator.bluetooth, SerialPort, ...) must be listed explicitly. Nothing
+    // else here is a pure-global @types package: React and Node types arrive
+    // through imports and Next's own references.
+    "types": ["web-bluetooth", "w3c-web-serial"],
     "plugins": [
       {
         "name": "next"
@@ -22,6 +28,6 @@
       "@/*": ["./*"]
     }
   },
-  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts", ".next/dev/types/**/*.ts"],
   "exclude": ["node_modules"]
 }
