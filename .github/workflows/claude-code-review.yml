@@ -41,39 +41,6 @@ jobs:
         with:
           fetch-depth: 0 # full history so the review can diff against the base
 
-      - name: Wait for this commit's CI run to finish
-        id: ci
-        # The review fires at the same time as CI; wait for the CI run of THIS
-        # head SHA to complete, then hand its id + conclusion to the review so it
-        # reads results instead of re-running tests. Best-effort: if CI hasn't
-        # finished within the cap, review anyway and say CI was still running.
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        run: |
-          repo=${{ github.repository }}
-          cap=$(( SECONDS + 45*60 ))   # wait up to ~45 min (firmware build is slow)
-          run_id=""; status=""; conclusion=""
-          while [ "$SECONDS" -lt "$cap" ]; do
-            line=$(gh run list --repo "$repo" --workflow CI --branch "$HEAD_REF" \
-                     --event pull_request --json databaseId,status,conclusion,headSha \
-                     --jq "[.[] | select(.headSha==\"$HEAD_SHA\")][0] // empty | \"\(.databaseId) \(.status) \(.conclusion)\"" 2>/dev/null || true)
-            run_id=$(echo "$line"     | awk '{print $1}')
-            status=$(echo "$line"     | awk '{print $2}')
-            conclusion=$(echo "$line" | awk '{print $3}')
-            if [ -n "$run_id" ] && [ "$status" = "completed" ]; then
-              break
-            fi
-            sleep 20
-          done
-          if [ "$status" != "completed" ]; then
-            conclusion="still_running_at_review_time"
-          fi
-          echo "run_id=$run_id"         >> "$GITHUB_OUTPUT"
-          echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
-          echo "Resolved CI run '$run_id' status='$status' conclusion='$conclusion'"
-
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
