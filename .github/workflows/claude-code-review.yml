@@ -25,8 +25,9 @@ jobs:
     # and the job would fail red on every fork PR.
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    # Must cover the CI wait (below, 15 min cap) plus the review itself.
-    timeout-minutes: 45
+    # Must cover the CI wait (below, ~45 min cap) plus the review itself. The
+    # firmware build is the long pole in CI.
+    timeout-minutes: 60
     permissions:
       contents: read # read-only: the review cannot push fixes
       pull-requests: write # post the review summary / progress comment
@@ -39,44 +40,6 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history so the review can diff against the base
-
-      # The gh poll loop the header comment promises: find this head commit's
-      # `CI` workflow run and wait for it, so the review below can read real
-      # results instead of re-running the tests. Outputs:
-      #   run_id      the CI run's id, or "" when no run was found
-      #   conclusion  success/failure/..., or "still_running_at_review_time"
-      #               when CI had not finished (or started) inside the cap.
-      # The cap is deliberately shorter than CI's own 15-minute timeout plus
-      # queue slack; a review of the diff on its own merits beats no review.
-      - name: Wait for this commit's CI run
-        id: ci
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          sha="${{ github.event.pull_request.head.sha }}"
-          deadline=$(( $(date +%s) + 20 * 60 ))
-          run_id=""
-          conclusion="still_running_at_review_time"
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            if [ -z "$run_id" ]; then
-              run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI \
-                --commit "$sha" --limit 1 --json databaseId \
-                --jq '.[0].databaseId // empty' || true)
-            fi
-            if [ -n "$run_id" ]; then
-              status=$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" \
-                --json status --jq '.status' || true)
-              if [ "$status" = "completed" ]; then
-                conclusion=$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" \
-                  --json conclusion --jq '.conclusion')
-                break
-              fi
-            fi
-            sleep 20
-          done
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-          echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
-          echo "CI run '$run_id' conclusion '$conclusion'"
 
       - name: Run Claude Code Review
         id: claude-review
