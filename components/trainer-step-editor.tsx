@@ -22,7 +22,7 @@
  * confusing than it is useful on a bench.
  */
 
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -31,7 +31,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import type { SupportedRange } from "@/lib/ftms/protocol"
 import { generateRamp, protocolDurationSeconds, type ProtocolStep } from "@/lib/trainer/protocol-runner"
-import { validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
+import { MAX_STEPS, validateSteps, type TrainerPreset } from "@/lib/trainer/presets"
 import { mmss } from "@/lib/trainer/format"
 
 export interface TrainerStepEditorProps {
@@ -86,16 +86,30 @@ export function TrainerStepEditor({
   const [rawCells, setRawCells] = useState<Partial<Record<CellKey, string>>>({})
   const [rampOpen, setRampOpen] = useState(false)
   const [rampFields, setRampFields] = useState<RampFields>(DEFAULT_RAMP_FIELDS)
+  const [rampMessage, setRampMessage] = useState<string | null>(null)
+  /**
+   * True while the next `steps` change originates HERE (a cell commit, a
+   * move/remove/add, a generated ramp), so the effect below can tell it from an
+   * external replacement. Internal edits manage exactly the rawCells entries
+   * they invalidate themselves; wiping ALL of them on every internal change
+   * would clear a half-typed value in row 1 the moment row 2 committed.
+   */
+  const internalStepsEditRef = useRef(false)
 
-  // Internal edits (move/remove/add/generate, below) clear rawCells themselves
-  // before calling onStepsChange, so this looks redundant for THOSE paths -
-  // but `steps` also changes out from under this component whenever the
-  // PARENT swaps it in wholesale (onLoadPreset), and nothing else observes
-  // that. Without this, an in-progress unparsable cell (e.g. "12x") survives
-  // a preset load and keeps shadowing the freshly loaded value in
-  // `cellValue`. `steps` gets a new array identity on every replacement,
-  // internal or external, so keying on it covers both without double logic.
+  function replaceSteps(next: ProtocolStep[]) {
+    internalStepsEditRef.current = true
+    onStepsChange(next)
+  }
+
+  // `steps` also changes out from under this component whenever the PARENT
+  // swaps it in wholesale (onLoadPreset), and nothing else observes that.
+  // Without this, an in-progress unparsable cell (e.g. "12x") survives a
+  // preset load and keeps shadowing the freshly loaded value in `cellValue`.
   useEffect(() => {
+    if (internalStepsEditRef.current) {
+      internalStepsEditRef.current = false
+      return
+    }
     setRawCells({})
   }, [steps])
 
@@ -105,7 +119,7 @@ export function TrainerStepEditor({
   const canSave = !disabled && protocolName.trim() !== "" && validationMessage === null
 
   function commitStep(index: number, patch: Partial<ProtocolStep>) {
-    onStepsChange(steps.map((step, i) => (i === index ? { ...step, ...patch } : step)))
+    replaceSteps(steps.map((step, i) => (i === index ? { ...step, ...patch } : step)))
   }
 
   /** One numeric cell: raw text until it parses, then a committed number. */
@@ -154,32 +168,58 @@ export function TrainerStepEditor({
     const next = [...steps]
     ;[next[index], next[target]] = [next[target], next[index]]
     setRawCells({}) // indices shifted - any in-progress cell text no longer refers to the same row
-    onStepsChange(next)
+    replaceSteps(next)
   }
 
   function removeStep(index: number) {
     setRawCells({})
-    onStepsChange(steps.filter((_, i) => i !== index))
+    replaceSteps(steps.filter((_, i) => i !== index))
   }
 
   function addStep() {
     clearRawCellsForIndex(steps.length)
     const template = steps.length > 0 ? steps[steps.length - 1] : DEFAULT_STEP
-    onStepsChange([...steps, { ...template }])
+    replaceSteps([...steps, { ...template }])
   }
 
+  /**
+   * Generate never fails silently: a button that does nothing is
+   * indistinguishable from a button that worked (the same reasoning as the
+   * panel's savePresetFromEditor), so every refusal says why - and the one
+   * silent truncation generateRamp performs (its MAX_STEPS cap) is said out
+   * loud too, because a ramp that quietly stops short of its end wattage would
+   * corrupt a bench sweep.
+   */
   function generate() {
     const startWatts = Number(rampFields.startWatts)
     const endWatts = Number(rampFields.endWatts)
     const incrementWatts = Number(rampFields.incrementWatts)
     const stepDurationSeconds = Number(rampFields.stepDurationSeconds)
-    if (![startWatts, endWatts, incrementWatts, stepDurationSeconds].every(Number.isFinite)) return
+    if (![startWatts, endWatts, incrementWatts, stepDurationSeconds].every(Number.isFinite)) {
+      setRampMessage("No ramp generated: every ramp field needs a number.")
+      return
+    }
 
     const ramp = generateRamp({ startWatts, endWatts, incrementWatts, stepDurationSeconds })
-    if (ramp.length === 0) return
+    if (ramp.length === 0) {
+      const problem =
+        incrementWatts === 0
+          ? "the increment cannot be 0"
+          : stepDurationSeconds <= 0
+            ? "the step duration must be positive"
+            : "the increment must step from start toward end (make it negative for a descending ramp)"
+      setRampMessage(`No ramp generated: ${problem}.`)
+      return
+    }
+
+    const lastWatts = ramp[ramp.length - 1].targetWatts
+    const truncated = Math.abs(endWatts - lastWatts) >= Math.abs(incrementWatts)
+    setRampMessage(
+      truncated ? `Ramp capped at ${MAX_STEPS} steps - it stops at ${lastWatts} W, short of ${endWatts} W.` : null,
+    )
 
     setRawCells({})
-    onStepsChange(ramp)
+    replaceSteps(ramp)
     if (protocolName.trim() === "") {
       onNameChange(`Ramp ${startWatts}→${endWatts} W +${incrementWatts} W/${stepDurationSeconds}s`)
     }
@@ -377,6 +417,8 @@ export function TrainerStepEditor({
               </Button>
             </div>
           )}
+
+          {rampOpen && rampMessage && <p className="mt-2 text-sm text-amber-600">{rampMessage}</p>}
         </div>
       </CardContent>
     </Card>

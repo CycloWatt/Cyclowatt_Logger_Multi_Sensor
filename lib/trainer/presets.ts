@@ -196,13 +196,19 @@ export function readPresets(store: StringStore = defaultStore()): TrainerPreset[
 }
 
 /**
- * Create or update a user preset, matched by its trimmed name.
+ * Create or update a user preset - matched by id when the caller supplies one
+ * (a rename keeps the preset's identity), by trimmed name otherwise.
  *
  * A name matching a built-in is refused outright - the runner and any export
  * assumes a name identifies one protocol, and a same-named user preset would
  * make that ambiguous. Invalid steps are refused the same way. Either
  * rejection returns the unchanged list and touches the store not at all, so a
  * failed save is indistinguishable from having never been attempted.
+ *
+ * The dedupe filter drops BOTH any old row carrying the id and any other row
+ * carrying the name: ids and names each identify exactly one preset, and an
+ * explicit-id save renaming onto another preset's name must not leave two rows
+ * sharing either (deletePreset would otherwise take both down with one id).
  */
 export function savePreset(
   preset: { id?: string; name: string; steps: ProtocolStep[] },
@@ -214,7 +220,10 @@ export function savePreset(
   if (validateSteps(preset.steps) !== null) return readPresets(store)
 
   const userPresets = readUserPresets(store)
-  const existing = userPresets.find((p) => p.name === name)
+  const existing =
+    preset.id !== undefined
+      ? userPresets.find((p) => p.id === preset.id)
+      : userPresets.find((p) => p.name === name)
   const next: TrainerPreset = {
     id: preset.id ?? existing?.id ?? newPresetId(),
     name,
@@ -222,7 +231,7 @@ export function savePreset(
     savedAt: Date.now(),
   }
 
-  return write([next, ...userPresets.filter((p) => p.name !== name)], store)
+  return write([next, ...userPresets.filter((p) => p.id !== next.id && p.name !== name)], store)
 }
 
 /**

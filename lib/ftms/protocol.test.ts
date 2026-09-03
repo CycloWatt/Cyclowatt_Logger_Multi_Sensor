@@ -130,6 +130,13 @@ describe("supported ranges", () => {
     })
   })
 
+  it("names the short payload in the error rather than throwing a bare RangeError", () => {
+    // readOptional turns either throw into the spec default; the message is what
+    // makes "trainer sent a truncated range" greppable in the console.
+    expect(() => parseSupportedPowerRange(view(0x00, 0x00, 0xd0, 0x07))).toThrow(/4 bytes, expected 6/)
+    expect(() => parseSupportedResistanceRange(view(0x00, 0x00))).toThrow(/2 bytes, expected 6/)
+  })
+
   it("provides sane defaults for a trainer that does not publish a range", () => {
     expect(DEFAULT_POWER_RANGE).toEqual({ min: 0, max: 2000, increment: 1 })
     expect(DEFAULT_RESISTANCE_RANGE).toEqual({ min: 0, max: 1000, increment: 10 })
