@@ -25,6 +25,7 @@ import { SMP_SERVICE_UUID } from "@/lib/smp/client"
 import { BOARD_NAME_PREFIXES, BOARD_NAME_PREFIX_HINT, firmwareVersionFromName, isBoardName } from "@/lib/device-name"
 import { applyDeviceName, nextDisplayName } from "@/lib/device-list"
 import { readGapDeviceName } from "@/lib/gap-name"
+import { parseCyclingPowerMeasurement } from "@/lib/cps/measurement"
 import { CPS_SERVICE_UUID } from "@/lib/cps/protocol"
 import { CalibrationCard, type CalibrationReading } from "@/components/calibration-card"
 import { CalibrationHistoryCard } from "@/components/calibration-history-card"
@@ -44,7 +45,12 @@ import {
   forceChannelLabel,
   forceDataKey,
 } from "@/lib/raw-stream/force-channels"
+import { readBenchPrefs, writeBenchPrefs } from "@/lib/bench-prefs"
+import { parseDataPacket as parsePacket, type DataPoint } from "@/lib/raw-stream/packet"
+import { rawCsvFilename, rawStreamToCsv } from "@/lib/raw-stream/csv"
 import { DfuCard } from "@/components/dfu-card"
+import { SerialSyncCard } from "@/components/serial-sync-card"
+import { useSerialSync } from "@/hooks/use-serial-sync"
 import { TrainerPanel } from "@/components/trainer-panel"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 
@@ -53,61 +59,6 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 // cost of a capture, and the log strings were built even with DevTools closed.
 // Flip to true only when actually debugging the packet stream.
 const DEBUG_PACKET_LOG = false
-
-// One localStorage record for the bench switches (CSV capture, chooser
-// filter), so a page reload keeps the operator's setup. Same store-and-key
-// style as the flash history ("cyclowatt-flash-history").
-const PREFS_KEY = "cyclowatt-bench-prefs"
-
-interface BenchPrefs {
-  csvCaptureEnabled?: boolean
-  useDeviceFilter?: boolean
-}
-
-// Read/write are both best-effort: localStorage can throw (blocked cookies,
-// storage-restricted embeds), and prefs must never take the logger down.
-function readBenchPrefs(): BenchPrefs {
-  try {
-    const raw = window.localStorage.getItem(PREFS_KEY)
-    if (!raw) return {}
-    const parsed: unknown = JSON.parse(raw)
-    return typeof parsed === "object" && parsed !== null ? (parsed as BenchPrefs) : {}
-  } catch {
-    return {}
-  }
-}
-
-function writeBenchPrefs(update: Partial<BenchPrefs>): void {
-  try {
-    window.localStorage.setItem(PREFS_KEY, JSON.stringify({ ...readBenchPrefs(), ...update }))
-  } catch {
-    // non-fatal - the switch still works for this session
-  }
-}
-
-interface DataPoint {
-  timestamp: number
-  // Pre-formatted chart label for `timestamp`. Formatted ONCE here at parse
-  // time: formatting on every chart tick meant 500 Intl calls per 100 ms.
-  timeLabel: string
-  tick: number
-  ticksMcu: number
-  force0: number
-  force1: number
-  force2: number
-  force3: number
-  force4: number
-  force5: number
-  accelX: number
-  accelY: number
-  accelZ: number
-  gyroX: number
-  gyroY: number
-  gyroZ: number
-  power: number
-  referencePower: number
-  synchronization: number
-}
 
 // A type alias, not an interface, on purpose: aliases get TypeScript's implicit
 // index signature, which lets ChartDataPoint[] flow into the chart card's
@@ -319,10 +270,13 @@ export default function BluetoothDataLogger() {
     setCalibrationHistory(readCalibrationHistory())
   }, [])
 
-  const [serialPort, setSerialPort] = useState<SerialPort | null>(null)
-  const [isSerialConnected, setIsSerialConnected] = useState(false)
+  // Web Serial detection stays HERE, in the compatibility effect below, next to
+  // the Bluetooth and secure-context checks it shares an order of console lines
+  // and an error Alert with; the hook is handed the result.
   const [serialSupported, setSerialSupported] = useState<boolean>(true)
-  const [latestSerialValue, setLatestSerialValue] = useState<number>(0)
+  // The serial synchronization input: port, reader loop and throttled display.
+  // `serial.valueRef.current` is what the packet path stamps onto every row.
+  const serial = useSerialSync({ onError: setError, debugLog: DEBUG_PACKET_LOG })
 
   // Reference power meter (standard Cycling Power Service)
   const [refDevice, setRefDevice] = useState<BluetoothDevice | null>(null)
@@ -573,16 +527,6 @@ export default function BluetoothDataLogger() {
   const packetCountRef = useRef<number>(0)
   const lastPacketTimeRef = useRef<number>(Date.now())
 
-  const serialValueRef = useRef<number>(0)
-  // The reader yields decoded STRINGS (it sits behind a TextDecoderStream).
-  const serialReaderRef = useRef<ReadableStreamDefaultReader<string> | null>(null)
-  // Throttle state for the on-screen serial value: the ref above is always
-  // current (every packet logs it), but re-rendering the page per received
-  // line is pointless - the display updates at most ~5x/s, with a trailing
-  // flush so the last value of a burst still lands.
-  const serialFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const lastSerialFlushRef = useRef<number>(0)
-
   const refPowerValueRef = useRef<number>(0)
   const refCharacteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null)
 
@@ -603,9 +547,6 @@ export default function BluetoothDataLogger() {
   // from lib/cps/protocol, which the calibration flow shares - two copies of it
   // could drift and the symptom would be a SecurityError seconds into a procedure.
   const CPS_MEASUREMENT_CHAR_UUID = "00002a63-0000-1000-8000-00805f9b34fb" // cycling_power_measurement
-
-  // Expected packet: 16 x int32 = 64 bytes
-  const EXPECTED_PACKET_SIZE = 64
 
   // Check browser compatibility on mount
   useEffect(() => {
@@ -699,115 +640,6 @@ export default function BluetoothDataLogger() {
     })
 
     lastUpdateRef.current = now
-  }
-
-  const connectSerial = async () => {
-    try {
-      if (!("serial" in navigator)) {
-        setError("Web Serial API is not supported in this browser.")
-        return
-      }
-
-      console.log("\n🔌 CONNECTING TO SERIAL PORT...")
-      // Typed since @types/w3c-web-serial - the `as any` escape hatch is gone.
-      const port = await navigator.serial.requestPort()
-      await port.open({ baudRate: 9600 })
-
-      setSerialPort(port)
-      setIsSerialConnected(true)
-      console.log("✅ Serial port connected")
-
-      // Start reading serial data
-      startSerialReading(port)
-    } catch (err) {
-      console.error("Serial connection failed:", err)
-      setError(`Serial connection failed: ${err instanceof Error ? err.message : "Unknown error"}`)
-    }
-  }
-
-  // Leading + trailing throttle: immediate when the display is stale, else one
-  // deferred flush so the final value of a burst is never lost.
-  const queueSerialDisplayUpdate = () => {
-    const now = Date.now()
-    if (now - lastSerialFlushRef.current >= 200) {
-      lastSerialFlushRef.current = now
-      setLatestSerialValue(serialValueRef.current)
-    } else if (serialFlushTimerRef.current === null) {
-      serialFlushTimerRef.current = setTimeout(() => {
-        serialFlushTimerRef.current = null
-        lastSerialFlushRef.current = Date.now()
-        setLatestSerialValue(serialValueRef.current)
-      }, 200)
-    }
-  }
-
-  const startSerialReading = async (port: SerialPort) => {
-    try {
-      const textDecoder = new TextDecoderStream()
-      // The cast bridges two libs' stream generics: w3c-web-serial types the
-      // port as ReadableStream<Uint8Array> while lib.dom types the decoder's
-      // sink as WritableStream<BufferSource>; a Uint8Array IS a BufferSource.
-      const readableStreamClosed = port.readable!.pipeTo(textDecoder.writable as WritableStream<Uint8Array>)
-      const reader = textDecoder.readable.getReader()
-      serialReaderRef.current = reader
-
-      console.log("📡 Starting serial data reading...")
-
-      // Read data continuously
-      while (true) {
-        const { value, done } = await reader.read()
-        if (done) {
-          console.log("📡 Serial reader closed")
-          break
-        }
-
-        if (value) {
-          // Parse the incoming value as a number
-          const trimmedValue = value.trim()
-          const numValue = Number.parseFloat(trimmedValue)
-
-          if (!isNaN(numValue)) {
-            serialValueRef.current = numValue
-            queueSerialDisplayUpdate()
-            // Per-line log at serial line rate - debug only, like the packet log.
-            if (DEBUG_PACKET_LOG) console.log(`Serial data received: ${numValue}`)
-          }
-        }
-      }
-    } catch (err) {
-      console.error("Serial reading error:", err)
-      if (err instanceof Error && err.message.includes("device has been lost")) {
-        setIsSerialConnected(false)
-        setSerialPort(null)
-      }
-    }
-  }
-
-  const disconnectSerial = async () => {
-    try {
-      if (serialReaderRef.current) {
-        await serialReaderRef.current.cancel()
-        serialReaderRef.current = null
-      }
-
-      if (serialPort) {
-        await serialPort.close()
-        setSerialPort(null)
-      }
-
-      setIsSerialConnected(false)
-      serialValueRef.current = 0
-      // Cancel any deferred display flush so it cannot resurrect a stale value
-      // after the zeroing below.
-      if (serialFlushTimerRef.current !== null) {
-        clearTimeout(serialFlushTimerRef.current)
-        serialFlushTimerRef.current = null
-      }
-      setLatestSerialValue(0)
-      console.log("🔌 Serial port disconnected")
-    } catch (err) {
-      console.error("Serial disconnect error:", err)
-    }
   }
 
   // Connect to a reference power meter via the standard Cycling Power Service
@@ -905,11 +737,10 @@ export default function BluetoothDataLogger() {
   const handleReferencePowerNotification = (event: Event) => {
     const target = event.target as BluetoothRemoteGATTCharacteristic
     const dataView = target.value
-    if (!dataView || dataView.byteLength < 4) return
+    if (!dataView) return
 
-    // Byte 0-1: flags (uint16, little-endian)
-    // Byte 2-3: instantaneous power (sint16, watts, little-endian)
-    const instantaneousPower = dataView.getInt16(2, true)
+    const instantaneousPower = parseCyclingPowerMeasurement(dataView)
+    if (instantaneousPower === null) return
     refPowerValueRef.current = instantaneousPower
     setLatestRefPower(instantaneousPower)
   }
@@ -1382,94 +1213,33 @@ export default function BluetoothDataLogger() {
     }
   }
 
+  // The decode itself lives in lib/raw-stream/packet.ts (pure, and pinned by
+  // test vectors). What stays here is what only the page can supply: the two
+  // stamped values that are not on the wire, and the per-packet debug log, which
+  // needs the packet COUNTER the page owns.
   const parseDataPacket = (dataView: DataView): DataPoint | null => {
-    if (dataView.byteLength !== EXPECTED_PACKET_SIZE) {
-      console.warn(`❌ Invalid packet size: ${dataView.byteLength} bytes, expected ${EXPECTED_PACKET_SIZE}`)
-      return null
+    const labelDate = new Date()
+    const dataPoint = parsePacket(dataView, {
+      timestamp: labelDate,
+      referencePower: refPowerValueRef.current,
+      synchronization: serial.valueRef.current,
+    })
+    if (!dataPoint) return null
+
+    if (DEBUG_PACKET_LOG) {
+      const iso = labelDate.toISOString()
+      const { tick, ticksMcu, force0, force1, force2, force3, force4, force5, power } = dataPoint
+      const { accelX, accelY, accelZ, gyroX, gyroY, gyroZ } = dataPoint
+      console.log(`[${iso}] Packet #${packetCountRef.current + 1} tick=${tick} ticksMcu=${ticksMcu}`)
+      console.log(
+        `[${iso}] Force=[${force0}, ${force1}, ${force2}, ${force3}, ${force4}, ${force5}] PowerSlot=${power}`,
+      )
+      console.log(
+        `[${iso}] Accel=[${accelX}, ${accelY}, ${accelZ}] Gyro=[${gyroX}, ${gyroY}, ${gyroZ}] Sync=${serial.valueRef.current}`,
+      )
     }
 
-    try {
-      // 6 force channels (load cell values) — raw integers, not scaled.
-      //
-      // The wire slot IS the board's amp channel: the firmware reads Vout_meas_1..6
-      // into force_mv[0..5] straight (power-meter-fw src/drivers/force_sensor.c)
-      // and raw_stream_wire.c packs slot i to slot i, so no permutation happens
-      // anywhere between the ADC and here. Positions per slot live in
-      // lib/raw-stream/force-channels.ts — the one place that mapping is written.
-      const force0 = dataView.getInt32(0, true) // index 0 — front-right (J2)
-      const force1 = dataView.getInt32(4, true) // index 1 — back (J4)
-      const force2 = dataView.getInt32(8, true) // index 2 — front-left (J5)
-      const force3 = dataView.getInt32(12, true) // index 3 — front-right (J2)
-      const force4 = dataView.getInt32(16, true) // index 4 — back (J4)
-      const force5 = dataView.getInt32(20, true) // index 5 — front-left (J5)
-
-      // Accel — packed as milli-g, so /1000 yields g
-      const accelX = dataView.getInt32(24, true) / 1000 // index 6
-      const accelY = dataView.getInt32(28, true) / 1000 // index 7
-      const accelZ = dataView.getInt32(32, true) / 1000 // index 8
-
-      // Gyro — packed as milli-rad/s, so /1000 yields rad/s
-      const gyroX = dataView.getInt32(36, true) / 1000 // index 9
-      const gyroY = dataView.getInt32(40, true) / 1000 // index 10
-      const gyroZ = dataView.getInt32(44, true) / 1000 // index 11
-
-      // Power — frozen zero-fill slot, never a reading (see chartConfig.power).
-      // Parsed and exported anyway so the CSV column set stays stable.
-      const power = dataView.getInt32(48, true) // index 12
-
-      // Tick — raw integer
-      const tick = dataView.getInt32(52, true) // index 13
-
-      // ticks_mcu is a uint64 split into low/high uint32
-      const ticksLow = dataView.getUint32(56, true) // index 14 — lower 32 bits
-      const ticksHigh = dataView.getUint32(60, true) // index 15 — upper 32 bits
-      const ticksMcu = Number((BigInt(ticksHigh) << 32n) | BigInt(ticksLow))
-
-      const timestamp = Date.now()
-      const labelDate = new Date(timestamp)
-      const dataPoint: DataPoint = {
-        timestamp,
-        // Same "MM:SS.tenth" the chart axis always showed, hand-rolled: the
-        // toLocaleTimeString call it replaces goes through Intl, far too heavy
-        // for a per-packet path (and worse, it used to run per chart REDRAW).
-        timeLabel: `${String(labelDate.getMinutes()).padStart(2, "0")}:${String(
-          labelDate.getSeconds(),
-        ).padStart(2, "0")}.${Math.floor(labelDate.getMilliseconds() / 100)}`,
-        tick,
-        ticksMcu,
-        force0,
-        force1,
-        force2,
-        force3,
-        force4,
-        force5,
-        accelX,
-        accelY,
-        accelZ,
-        gyroX,
-        gyroY,
-        gyroZ,
-        power,
-        referencePower: refPowerValueRef.current,
-        synchronization: serialValueRef.current,
-      }
-
-      if (DEBUG_PACKET_LOG) {
-        const iso = labelDate.toISOString()
-        console.log(`[${iso}] Packet #${packetCountRef.current + 1} tick=${tick} ticksMcu=${ticksMcu}`)
-        console.log(
-          `[${iso}] Force=[${force0}, ${force1}, ${force2}, ${force3}, ${force4}, ${force5}] PowerSlot=${power}`,
-        )
-        console.log(
-          `[${iso}] Accel=[${accelX}, ${accelY}, ${accelZ}] Gyro=[${gyroX}, ${gyroY}, ${gyroZ}] Sync=${serialValueRef.current}`,
-        )
-      }
-
-      return dataPoint
-    } catch (error) {
-      console.error("❌ Error parsing data packet:", error)
-      return null
-    }
+    return dataPoint
   }
 
   // Start data streaming
@@ -1577,65 +1347,22 @@ export default function BluetoothDataLogger() {
     const recorded = dataBufferRef.current
     if (recorded.length === 0) return
 
-    const headers = [
-      "tick",
-      "ticks_mcu",
-      "force_0",
-      "force_1",
-      "force_2",
-      "force_3",
-      "force_4",
-      "force_5",
-      "accel_x",
-      "accel_y",
-      "accel_z",
-      "gyro_x",
-      "gyro_y",
-      "gyro_z",
-      "power",
-      "reference_power",
-      "synchronization",
-    ]
-    const csvContent = [
-      headers.join(","),
-      ...recorded.map((point) =>
-        [
-          point.tick,
-          point.ticksMcu,
-          point.force0,
-          point.force1,
-          point.force2,
-          point.force3,
-          point.force4,
-          point.force5,
-          point.accelX,
-          point.accelY,
-          point.accelZ,
-          point.gyroX,
-          point.gyroY,
-          point.gyroZ,
-          point.power,
-          point.referencePower,
-          point.synchronization,
-        ].join(","),
-      ),
-    ].join("\n")
+    // Columns, rows and filename all live in lib/raw-stream/csv.ts, where the
+    // 17 header strings are pinned by test - bench analysis scripts select them
+    // by name. What is left here is the Blob/anchor download dance, which needs
+    // a document.
+    const csvContent = rawStreamToCsv(recorded)
 
     const blob = new Blob([csvContent], { type: "text/csv" })
     const url = URL.createObjectURL(blob)
     const a = document.createElement("a")
     a.href = url
-    // Stamp the connected board's firmware version into the FILENAME only (CSV
-    // content stays byte-identical) so a bench capture is attributable to a build.
-    const timestampPart = new Date().toISOString().split("T")[0]
     // Read the LATCH, not `device?.name`: the usual bench order is record →
     // disconnect → export, and by export time handleDisconnection has already
     // nulled `device` while the recording survives and Export stays enabled — parsing
     // the live name here dropped the _fw tag exactly when it mattered most. The
     // live name is only a fallback for a session that predates the latch.
-    const fwVersion = connectedFwVersion ?? firmwareVersionFromName(device?.name)
-    const versionTag = fwVersion ? `_fw${fwVersion}` : ""
-    a.download = `cyclowatt_data_${timestampPart}${versionTag}.csv`
+    a.download = rawCsvFilename(new Date(), connectedFwVersion ?? firmwareVersionFromName(device?.name))
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
@@ -1687,7 +1414,7 @@ export default function BluetoothDataLogger() {
                   {isStreaming ? "Streaming Active" : "Streaming Paused"}
                 </Badge>
               )}
-              {isSerialConnected ? (
+              {serial.connected ? (
                 <Badge
                   variant="secondary"
                   className="bg-purple-600 text-white border-purple-500 flex items-center gap-1"
@@ -1748,34 +1475,14 @@ export default function BluetoothDataLogger() {
               data-state class — do not drop it, or both tabs render at once. */}
           <TabsContent value="streaming" forceMount className="mt-4 space-y-6 data-[state=inactive]:hidden">
             {connectionMode === "normal" && (
-              <Card className="bg-white border-gray-200">
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <Cable className="w-5 h-5" />
-                    Serial Synchronization Input
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="flex gap-2 items-center">
-                    {!isSerialConnected ? (
-                      <Button onClick={connectSerial} disabled={!serialSupported || !isSecureContext} variant="outline">
-                        Connect Serial Port
-                      </Button>
-                    ) : (
-                      <Button onClick={disconnectSerial} variant="outline">
-                        Disconnect Serial
-                      </Button>
-                    )}
-                    {isSerialConnected && (
-                      <div className="text-sm text-gray-600 p-3 bg-purple-50 border border-purple-200 rounded-lg">
-                        <div className="font-medium">Serial Port Connected</div>
-                        <div>Latest Value: {latestSerialValue}</div>
-                        <div className="text-xs text-gray-500 mt-1">This value is logged with each Bluetooth data packet</div>
-                      </div>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
+              <SerialSyncCard
+                supported={serialSupported}
+                secure={isSecureContext}
+                connected={serial.connected}
+                latestValue={serial.latestValue}
+                onConnect={serial.connect}
+                onDisconnect={serial.disconnect}
+              />
             )}
 
             {/* Reference Power Meter */}
