@@ -1,0 +1,236 @@
+name: Claude Code Review
+
+# Triggered directly on the PR (not via workflow_run) so the review is VISIBLE:
+# it shows up in the PR's checks section (pending -> in progress -> done) and
+# posts a live "Claude is reviewing" comment via track_progress — you always
+# see a review is on the way and never merge blind. Each review run posts its
+# own new comment (use_sticky_comment off) so round-to-round progress stays
+# visible in the PR instead of being overwritten. The first job step
+# WAITS for this commit's CI run to finish (a gh poll loop, no third-party
+# action) and hands the result to the review, so the review stays CI-aware
+# without re-running the tests.
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+# A newer push supersedes an in-flight review of the same PR (including one still
+# waiting for CI below).
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    # Fork PRs don't receive secrets: CLAUDE_CODE_OAUTH_TOKEN would resolve empty
+    # and the job would fail red on every fork PR.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # Must cover the CI wait (below, ~45 min cap) plus the review itself. The
+    # firmware build is the long pole in CI.
+    timeout-minutes: 60
+    permissions:
+      contents: read # read-only: the review cannot push fixes
+      pull-requests: write # post the review summary / progress comment
+      issues: write # PR comments are "issue" comments
+      id-token: write
+      actions: read # poll + read this PR's CI run results
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history so the review can diff against the base
+
+      - name: Wait for this commit's CI run to finish
+        id: ci
+        # The review fires at the same time as CI; wait for the CI run of THIS
+        # head SHA to complete, then hand its id + conclusion to the review so it
+        # reads results instead of re-running tests. Best-effort: if CI hasn't
+        # finished within the cap, review anyway and say CI was still running.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          repo=${{ github.repository }}
+          cap=$(( SECONDS + 45*60 ))   # wait up to ~45 min (firmware build is slow)
+          run_id=""; status=""; conclusion=""
+          while [ "$SECONDS" -lt "$cap" ]; do
+            line=$(gh run list --repo "$repo" --workflow CI --branch "$HEAD_REF" \
+                     --event pull_request --json databaseId,status,conclusion,headSha \
+                     --jq "[.[] | select(.headSha==\"$HEAD_SHA\")][0] // empty | \"\(.databaseId) \(.status) \(.conclusion)\"" 2>/dev/null || true)
+            run_id=$(echo "$line"     | awk '{print $1}')
+            status=$(echo "$line"     | awk '{print $2}')
+            conclusion=$(echo "$line" | awk '{print $3}')
+            if [ -n "$run_id" ] && [ "$status" = "completed" ]; then
+              break
+            fi
+            sleep 20
+          done
+          if [ "$status" != "completed" ]; then
+            conclusion="still_running_at_review_time"
+          fi
+          echo "run_id=$run_id"         >> "$GITHUB_OUTPUT"
+          echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
+          echo "Resolved CI run '$run_id' status='$status' conclusion='$conclusion'"
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'pr-review-toolkit@claude-code-plugins'
+          # track_progress posts a live PR comment (visible even with no
+          # line-level findings) and, with a pull_request trigger, the run also
+          # shows as a check on the PR. use_sticky_comment is off so each review
+          # run posts its own new comment, keeping round-to-round progress
+          # visible in the PR; track_progress still drives the live progress
+          # spinner inside each new comment.
+          track_progress: true
+          use_sticky_comment: false
+          # CI-result access for the Claude process (the job-level
+          # `permissions: actions: read` only scopes the token).
+          additional_permissions: |
+            actions: read
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number }}.
+
+            HOW YOUR OUTPUT REACHES THE USER — READ FIRST:
+            Your normal chat responses are NOT visible to anyone. The ONLY way to
+            deliver the review is to call the tool
+            `mcp__github_comment__update_claude_comment`. This run is NOT complete
+            until you have called that tool with the full summary described in
+            Step 2 — do this even if the review finds nothing (say so explicitly).
+            Never leave the comment showing the "running" spinner.
+
+            Step 1 — Analyze the diff.
+            Run /pr-review-toolkit:review-pr code errors tests comments and use any other
+            appropriate skills (this is firmware — the embedded-reviewer lens applies).
+            Treat that command and any subagents it spawns as INTERNAL analysis only:
+            gather their findings so you can consolidate them yourself in Step 2.
+            Their output is not visible to the user.
+
+            Do NOT run any tests yourself. The `CI` workflow has already run the
+            host unit fast lane (gcc, no NCS), the firmware build (prod image
+            `cyclowatt/nrf52840`, NCS v2.7.0), and the native_sim ztest tiers
+            (unit + regression) for this exact commit: run ID
+            "${{ steps.ci.outputs.run_id }}", conclusion
+            "${{ steps.ci.outputs.conclusion }}". Read the per-job results with
+            `gh run view ${{ steps.ci.outputs.run_id }}` (add `--log-failed` for
+            failing jobs) and factor their pass/fail into the review instead of
+            re-running them. Lead the summary with the CI status. If the conclusion
+            is "still_running_at_review_time", say CI had not finished and review
+            the diff on its own merits. Do NOT use `gh pr checks` — the token has
+            no checks/statuses scope; the Actions API above is the supported path.
+
+            SCOPE — focus the review on the code surface that carries risk:
+            `src/`, `tests/`, `boards/`, `.github/`, and the build config
+            (`prj.conf`, `Kconfig`, `CMakeLists.txt`, `west.yml`). Never deep-read
+            generated `build*/` output, and treat `docs/` as low-priority context.
+            Mind the non-negotiables: the customer-facing prod image must stay free
+            of DAQ/raw-stream/debug code (image separation is compile-time), and the
+            SDK pin in `west.yml` must remain an exact tag.
+
+            Step 2 — Post the review (REQUIRED).
+            Call `mcp__github_comment__update_claude_comment` exactly once with a
+            single summary containing these sections, each referencing concrete
+            file:line locations:
+            - Critical issues (must fix before merge)
+            - Important issues (should fix)
+            - Suggestions (nice to have)
+            - Strengths
+            - Recommended action
+            If a section has no items, keep the heading and write "None".
+            BUDGET GUARD — if you notice the turn or context budget running low
+            before the analysis is exhaustive, post the partial summary you have
+            IMMEDIATELY (note that it is partial and which areas were not fully
+            reviewed). Never end the run leaving the comment on the "running"
+            spinner.
+
+            Step 3 — Improve this PR's title and description if it's empty or the content changed materially.
+            Inspect the current metadata first with
+            `gh pr view ${{ github.event.pull_request.number }}`, then rewrite via
+            `gh pr edit ${{ github.event.pull_request.number }} --title ... --body ...`:
+            - Title: concise, imperative, scoped to what the diff actually changes.
+            - Body: a short summary of what changed and why, plus a brief test/validation
+              note. Preserve any human-written intent, context, linked issues, or
+              checklists already present — improve wording and fill gaps, don't discard
+              them. Keep it in English and Markdown.
+            If this step fails (e.g. missing permissions), make sure Step 2's comment
+            was still posted and note the failure inside that comment.
+          # `Task` lets /pr-review-toolkit:review-pr dispatch its review sub-agents
+          # (without it every dispatch is permission-denied and the review stalls);
+          # `gh run view`/`gh run list` read the CI results; `gh pr view`/`gh pr edit`
+          # cover Step 3; `gh pr diff`/`git diff`/`git log` give the changed-lines
+          # view. The review summary is delivered by the track_progress comment tool
+          # (`mcp__github_comment__update_claude_comment`), not a `gh` command.
+          # `--max-turns` bounds a runaway review; the prompt's BUDGET GUARD posts a
+          # partial summary as it approaches the cap.
+          claude_args: |
+            --model opus
+            --max-turns 40
+            --allowed-tools "Task,Bash(gh pr view:*),Bash(gh pr edit:*),Bash(gh pr diff:*),Bash(gh run view:*),Bash(gh run list:*),Bash(git diff:*),Bash(git log:*)"
+
+      - name: Explain review failure on the PR (usage/rate limit, timeout, or size)
+        # The review step can fail WITHOUT posting a summary — most often the OAuth
+        # token hits a Claude usage limit, or a very large PR exhausts the review
+        # turn budget/timeout. Instead of leaving the sticky comment stuck on the
+        # spinner, forward the whole recorded error as a marker-keyed PR comment
+        # (edited in place on repeats). Fork PRs never reach this job (job-level
+        # `if`), so GITHUB_TOKEN keeps write access here.
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+        run: |
+          pr=${{ github.event.pull_request.number }}
+          repo=${{ github.repository }}
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          marker='<!-- claude-review-failure -->'
+
+          # Forward the WHOLE recorded error, not a hand-picked line. Prefer any
+          # error/result strings the executor logged (JSON); fall back to the raw
+          # tail. Bound the output so the PR comment stays within GitHub limits.
+          log="${EXECUTION_FILE:-/home/runner/work/_temp/claude-execution-output.json}"
+          err=""
+          if [ -f "$log" ]; then
+            err=$(jq -r '[.. | objects | (.error? // .result? // empty)] | map(select(type == "string" and . != "")) | .[-5:] | .[]' "$log" 2>/dev/null || true)
+            if [ -z "$err" ]; then
+              err=$(tail -c 6000 "$log" || true)
+            fi
+          fi
+          # Hard cap regardless of source (~6000 chars).
+          err=$(printf '%s' "$err" | tail -c 6000)
+
+          {
+            echo "$marker"
+            echo "### :warning: Automated Claude review did not complete"
+            echo
+            echo "The review job failed before posting a summary. Full error the executor recorded:"
+            echo
+            if [ -n "$err" ]; then
+              echo '```'
+              printf '%s\n' "$err"
+              echo '```'
+              echo
+              echo "_(Verbatim from the Claude CLI — the wording is the tool's own; for usage/rate limits it can be generic about which limit was hit.)_"
+            else
+              echo "_No error detail was captured by the executor (likely a startup/timeout failure)._"
+            fi
+            echo
+            echo "It re-runs automatically on the next push to the PR, or you can re-run the failed job."
+            echo
+            echo "[View job run]($run_url)"
+          } > claude-review-failure.md
+
+          # Delete any prior failure comments first, then post fresh. Editing one in
+          # place leaves it at its ORIGINAL timeline position (buried at the top of a
+          # long PR), so it reads as "no comment". Posting fresh keeps the notice at
+          # the bottom where it's seen. Marker-keyed, so only ever one exists.
+          for cid in $(gh api --paginate "repos/$repo/issues/$pr/comments" \
+                         --jq "map(select(.body | startswith(\"$marker\"))) | .[].id"); do
+            gh api -X DELETE "repos/$repo/issues/comments/$cid" >/dev/null 2>&1 || true
+          done
+          gh api -X POST "repos/$repo/issues/$pr/comments" -F body=@claude-review-failure.md >/dev/null
+          echo "posted fresh failure comment"
