@@ -20,27 +20,19 @@
  * still lands, and `cancel()` on disconnect so a deferred flush cannot resurrect
  * the value the disconnect just zeroed.
  *
- * WHY `supported` IS AN INPUT AND NOT ALSO AN OUTPUT: the page detects Web Serial in
- * the same mount effect that detects Web Bluetooth and the secure context, in a
- * fixed order of console lines, and the same effect raises the shared HTTPS
- * error. Splitting the serial third into a hook effect would reorder those logs
- * (a hook's effect runs before the component's own), so the detection stays put
- * and its result is handed in - the option records which detection this hook
- * belongs to. It is not handed back out, and the hook does not branch on it:
- * `connectSerial` re-checks `"serial" in navigator` itself, so a mirrored
- * `supported` on the returned shape would only be a second copy of the page's
- * own value, free to disagree with it.
+ * WHY THERE IS NO `supported` OPTION: the page detects Web Serial itself (in the
+ * same mount effect that detects Web Bluetooth, for its compatibility banner),
+ * and this hook does not need the result - `connectSerial` re-checks
+ * `"serial" in navigator` at call time, which is the only moment it matters.
  */
 
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { createThrottle, type Throttle } from "@/lib/throttle"
 
 /** The on-screen value updates at most ~5x/s; the ref stays current. */
 const DISPLAY_FLUSH_MS = 200
 
 export interface UseSerialSyncOptions {
-  /** Web Serial availability, detected by the page's compatibility effect. */
-  supported: boolean
   /** The page's single error Alert. */
   onError: (message: string) => void
   /** Mirrors the page's DEBUG_PACKET_LOG: per-line console output when true. */
@@ -63,6 +55,10 @@ export function useSerialSync({ onError, debugLog = false }: UseSerialSyncOption
   const serialValueRef = useRef<number>(0)
   // The reader yields decoded STRINGS (it sits behind a TextDecoderStream).
   const serialReaderRef = useRef<ReadableStreamDefaultReader<string> | null>(null)
+  // Mirror of the `serialPort` state for the unmount cleanup below: a
+  // mount-keyed cleanup closure captures the first render, where the state is
+  // still null, so it must read a ref the connect flow keeps current.
+  const serialPortRef = useRef<SerialPort | null>(null)
 
   // One throttle instance for the life of the component: it holds the last-flush
   // timestamp and the pending timer that a re-created one would forget.
@@ -78,6 +74,30 @@ export function useSerialSync({ onError, debugLog = false }: UseSerialSyncOption
   }
   const throttle = throttleRef.current
 
+  /*
+   * Unmount: without this the `while (true)` reader loop and any deferred
+   * display flush both outlive the hook, calling setState on an unmounted
+   * component. Best-effort teardown through the REFS (see serialPortRef): the
+   * reader must be cancelled before the port can close, and neither failing is
+   * news on a link that may already be gone.
+   */
+  useEffect(
+    () => () => {
+      const reader = serialReaderRef.current
+      serialReaderRef.current = null
+      const port = serialPortRef.current
+      serialPortRef.current = null
+      if (reader || port) {
+        void (async () => {
+          await reader?.cancel().catch(() => {})
+          await port?.close().catch(() => {})
+        })()
+      }
+      throttle.cancel()
+    },
+    [throttle],
+  )
+
   const connectSerial = async () => {
     try {
       if (!("serial" in navigator)) {
@@ -91,6 +111,7 @@ export function useSerialSync({ onError, debugLog = false }: UseSerialSyncOption
       await port.open({ baudRate: 9600 })
 
       setSerialPort(port)
+      serialPortRef.current = port
       setIsSerialConnected(true)
       console.log("✅ Serial port connected")
 
@@ -140,6 +161,7 @@ export function useSerialSync({ onError, debugLog = false }: UseSerialSyncOption
       if (err instanceof Error && err.message.includes("device has been lost")) {
         setIsSerialConnected(false)
         setSerialPort(null)
+        serialPortRef.current = null
       }
     }
   }
@@ -154,6 +176,7 @@ export function useSerialSync({ onError, debugLog = false }: UseSerialSyncOption
       if (serialPort) {
         await serialPort.close()
         setSerialPort(null)
+        serialPortRef.current = null
       }
 
       setIsSerialConnected(false)

@@ -276,7 +276,7 @@ export default function BluetoothDataLogger() {
   const [serialSupported, setSerialSupported] = useState<boolean>(true)
   // The serial synchronization input: port, reader loop and throttled display.
   // `serial.valueRef.current` is what the packet path stamps onto every row.
-  const serial = useSerialSync({ supported: serialSupported, onError: setError, debugLog: DEBUG_PACKET_LOG })
+  const serial = useSerialSync({ onError: setError, debugLog: DEBUG_PACKET_LOG })
 
   // Reference power meter (standard Cycling Power Service)
   const [refDevice, setRefDevice] = useState<BluetoothDevice | null>(null)

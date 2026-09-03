@@ -1,11 +1,13 @@
 /**
  * One home for the trainer's mode vocabulary.
  *
- * `TrainerMode` (session-log.ts) and manual control's `ManualSubMode` used to
- * overlap with no shared type: the panel translated between them with two
- * inline ternaries. That's fine as long as the two vocabularies never drift,
- * but the mapping belongs next to the types it maps, not duplicated at every
- * call site - so it lives here, and both components import it.
+ * `TrainerMode` is DEFINED in session-log.ts (it is a CSV row column first)
+ * and re-exported here; every other module imports it from this file, so
+ * "where does the mode vocabulary live" has one answer. `ManualSubMode` used
+ * to overlap with it with no shared type: the panel translated between them
+ * with two inline ternaries. That's fine as long as the two vocabularies
+ * never drift, but the mapping belongs next to the types it maps, not
+ * duplicated at every call site - so it lives here too.
  */
 
 export type { TrainerMode } from "./session-log"

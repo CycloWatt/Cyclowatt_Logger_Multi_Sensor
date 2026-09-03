@@ -47,10 +47,9 @@ export function readBenchPrefs(store: StringStore = defaultStore()): BenchPrefs 
 }
 
 /**
- * Merge `update` over the stored prefs and persist the result.
- *
- * Returns the merged prefs even when the write failed, so a caller that renders
- * the return value still shows the setting it just applied.
+ * Merge `update` over the stored prefs and persist the result. The UI callers
+ * ignore the return value; it exists so the tests can assert the merge without
+ * re-reading a store that may have refused the write.
  */
 export function writeBenchPrefs(update: Partial<BenchPrefs>, store: StringStore = defaultStore()): BenchPrefs {
   const merged: BenchPrefs = { ...readBenchPrefs(store), ...update }

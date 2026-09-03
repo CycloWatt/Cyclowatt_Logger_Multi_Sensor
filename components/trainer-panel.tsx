@@ -56,7 +56,7 @@ const RUNNER_TICK_MS = 250
 
 export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanelProps) {
   /* The one collaborator that is not React, plus the mirror of its snapshot. */
-  const { snapshot, controller } = useTrainerController({ bluetoothAvailable, boardDeviceId })
+  const { snapshot, controller } = useTrainerController({ boardDeviceId })
   const {
     capabilities,
     chartData,

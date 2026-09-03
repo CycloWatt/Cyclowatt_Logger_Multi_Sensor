@@ -6,7 +6,7 @@
 
 import { mmss } from "./format"
 import type { RunnerStatus } from "./protocol-runner"
-import type { TrainerMode } from "./session-log"
+import type { TrainerMode } from "./mode"
 import type { ManualTargetSent } from "./targets"
 
 /** No notification for this long and every readout greys out. */
@@ -53,8 +53,8 @@ export function stepLabel(a: {
 /**
  * The elapsed readout: protocol elapsed / total while the runner is not
  * idle, else recorded time - which needs BOTH `recording` and a log, since
- * `logStartedAtMs` is null exactly when there is no log (see the panel's
- * `logRef.current?.startedAtMs ?? null`).
+ * `logStartedAtMs` is null exactly when there is no log (see
+ * TrainerSnapshot.logStartedAtMs in lib/trainer/controller.ts).
  */
 export function elapsedLabel(a: {
   mode: TrainerMode

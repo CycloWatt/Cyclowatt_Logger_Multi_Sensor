@@ -519,6 +519,42 @@ describe("disconnect", () => {
     expect(h.rows().slice(-1)).toEqual(["disconnected: disconnected by the operator"])
   })
 
+  it("queues a manual send behind an in-flight protocol-end chain instead of interleaving", async () => {
+    const h = await connected([{ targetWatts: 150, durationSeconds: 60 }])
+    await h.controller.startProtocol()
+    await flush()
+    h.calls.length = 0
+
+    // Hold the coast-down chain open at its 50 W write, then fire a manual send
+    // while it is in flight. Unserialised, the manual sequence's 0x07 would land
+    // between the 50 W and the Stop - and the trainer would end up stopped (or
+    // started) at odds with what the readout claims.
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const originalSetTargetPower = h.fake.session.setTargetPower
+    h.fake.session.setTargetPower = async (watts: number) => {
+      h.fake.session.setTargetPower = originalSetTargetPower // only this write hangs
+      await originalSetTargetPower(watts)
+      await gate
+    }
+
+    h.controller.dispatchRunner({ type: "stop" }) // queues the 50 W -> Stop chain
+    h.controller.changeMode("manual-power") // queues the manual sequence behind it
+    await flush()
+    expect(h.calls).toEqual(["setTargetPower:50"]) // the chain is parked on the gate; nothing cut in
+
+    release()
+    await flush()
+    expect(h.calls).toEqual([
+      "setTargetPower:50",
+      "stop", // the chain finishes first...
+      "start", // ...then the manual sequence runs whole: 0x07 (Stop un-started the trainer)
+      "setTargetPower:100", // and its target
+    ])
+  })
+
   it("does not raise the control-lost alarm for its own disconnect Reset", async () => {
     const h = await connected()
     // A trainer may answer a client Reset with a control-permission-lost status;
@@ -1137,9 +1173,39 @@ describe("dispose", () => {
     expect(h.rows().length).toBe(before)
     expect(h.controller.snapshot.live).toBe(published)
   })
+
+  it("does not raise the control-lost alarm for its own dispose Reset", async () => {
+    const h = await connected()
+    // As on the disconnect path: a trainer may answer the release Reset with a
+    // control-permission-lost status before dispose unsubscribes, and that must
+    // not write the control-lost row this teardown promises it never writes.
+    const originalReset = h.fake.session.reset
+    h.fake.session.reset = () => {
+      h.controlLost()
+      return originalReset()
+    }
+    const before = h.rows().length
+
+    h.controller.dispose()
+    await flush()
+
+    expect(h.controller.snapshot.error).toBe("")
+    expect(h.rows().length).toBe(before)
+  })
 })
 
 describe("snapshot and subscribe", () => {
+  it("publishes the editor setters and the clock into the snapshot", async () => {
+    const h = await connected()
+    h.controller.setSteps(TWO_STEPS)
+    h.controller.setProtocolName("Ramp")
+    h.controller.setNowTick(42_000)
+    const snapshot = h.controller.snapshot
+    expect(snapshot.steps).toEqual(TWO_STEPS)
+    expect(snapshot.protocolName).toBe("Ramp")
+    expect(snapshot.nowTick).toBe(42_000)
+  })
+
   it("rebuilds a NEW snapshot object on every change and never mutates the old one", async () => {
     const h = await connected()
     const first = h.controller.snapshot

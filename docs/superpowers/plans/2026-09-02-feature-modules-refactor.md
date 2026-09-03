@@ -8,7 +8,7 @@
 
 **Tech Stack:** Next.js 14 static export, React 18, TypeScript strict (`isolatedModules`), vitest 4 (node environment, no DOM), shadcn/ui. **No new dependencies.**
 
-**Spec:** `.superpowers/sdd/rework-kickoff.md` (mandate + guardrails) and the architecture design recorded in `.superpowers/sdd/refactor-feature-modules/design.md`.
+**Spec:** the kickoff mandate and architecture design were session-local working files (`.superpowers/sdd/...`, not tracked in this repo); everything a reviewer needs from them is inlined below - the guardrails under Global Constraints and the behaviour inventory under Behaviour oracle.
 
 ## Global Constraints
 
@@ -26,7 +26,7 @@
 
 ## Behaviour oracle (reviewers trace against this)
 
-Full inventory in `.superpowers/sdd/refactor-feature-modules/design.md` §A. Key invariants:
+Key invariants (the full inventory lived in the untracked design doc; these are the ones reviews trace):
 
 - `sendControl` never throws; no session → `false` and **no** log row; success row `"<label> -> success"`; 0x05 (control not permitted) → Request Control, `markControl(true)`, if `restartAfterRetake !== false` then `startedRef=false`, 0x07, `startedRef=true`; re-run; row `"<label> -> success after re-taking control[ and re-starting]"`; retry failure → `markControl(false)`, `startedRef=false`, row `"<label> -> failed after re-taking control: <msg>"`, error `"<label> failed: <msg>"`.
 - `applyEvents`: (1) rows first in event order (`step-started` → `"step <i+1> target <W> W"`, `resumed` → `"target <W> W"`, others `""`); (2) `send:false` or no session → return; (3) finishing: `watts = clampToRange(50, powerRange)`, `stopping`, `needsRestart = !startedRef`, if stopping `startedRef=false` synchronously; async chain `[0x07 if needsRestart (abort all on failure; startedRef=true only if !stopping)] → 0x05 50 W → [0x08 STOP if stopping, restartAfterRetake:false]`; (4) else if runner status after commit `!== "paused"` → 0x05 for the LAST `step-started`/`resumed`; (5) `paused` present → 0x08 PAUSE (`restartAfterRetake:false`), then `startedRef=false`.
@@ -327,7 +327,7 @@ Rules: private fields replace today's refs one-for-one (`session`, `hasControl`,
 
 ### Task 12: panel-track verification
 
-- [ ] `npx vitest run`, `npx tsc --noEmit -p tsconfig.json`, `npm run build`; record outputs in `.superpowers/sdd/refactor-feature-modules/verify-panel-track.md`; no commit unless something needed fixing.
+- [ ] `npx vitest run`, `npx tsc --noEmit -p tsconfig.json`, `npm run build`; record outputs in the session's working notes (untracked); no commit unless something needed fixing.
 
 ---
 

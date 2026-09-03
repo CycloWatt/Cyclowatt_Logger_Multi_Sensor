@@ -11,8 +11,8 @@
  * ordered effect stream (0x00 before 0x07 before 0x05, one `control-result` row
  * per op) is testable in the repo's node-only vitest with a fake session and a
  * fake device, the way lib/ftms/control.test.ts tests the GATT layer. See
- * .superpowers/sdd/refactor-feature-modules/design.md for the Option 3 ruling
- * and the behaviour inventory this class must preserve.
+ * docs/superpowers/plans/2026-09-02-feature-modules-refactor.md for the
+ * behaviour inventory this class must preserve.
  *
  * WHY A SNAPSHOT + subscribe. React still has to render this state. Rather than
  * a dozen setState mirrors, the controller keeps ONE plain object rebuilt on
@@ -816,12 +816,21 @@ export class TrainerController {
     const release = this.hasControl
     this.session = null
     if (session) {
+      // As in disconnect(): the Reset makes the trainer notify
+      // controlPermissionLost, and that notification can land before
+      // session.dispose() unsubscribes - unguarded, onControlLost would write
+      // the very control-lost row this doc block promises dispose never writes.
+      if (release) this.releasingControl = true
       void (async () => {
-        if (release) {
-          await session.stop().catch(() => {})
-          await session.reset().catch(() => {})
+        try {
+          if (release) {
+            await session.stop().catch(() => {})
+            await session.reset().catch(() => {})
+          }
+          await session.dispose()
+        } finally {
+          this.releasingControl = false
         }
-        await session.dispose()
       })()
     }
     this.throttle.cancel()
@@ -1204,7 +1213,6 @@ export class TrainerController {
     this.log = log
     this.recording = true
     this.sampleCount = 0
-    this.eventCount = 1 // the session-start row below
     appendEvent(log, {
       epochMs: startedAtMs,
       elapsedS: 0,
@@ -1214,6 +1222,7 @@ export class TrainerController {
       event: "session-start",
       detail: this.connected ? `recording started, ${this.deviceName} connected` : "recording started, not connected",
     })
+    this.eventCount = log.events.length
     this.emit()
   }
 

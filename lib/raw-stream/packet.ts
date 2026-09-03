@@ -78,12 +78,12 @@ export function parseDataPacket(dataView: DataView, ctx: PacketContext): DataPoi
     // and raw_stream_wire.c packs slot i to slot i, so no permutation happens
     // anywhere between the ADC and here. Positions per slot live in
     // lib/raw-stream/force-channels.ts — the one place that mapping is written.
-    const force0 = dataView.getInt32(0, true) // index 0 — front-right (J2)
-    const force1 = dataView.getInt32(4, true) // index 1 — back (J4)
-    const force2 = dataView.getInt32(8, true) // index 2 — front-left (J5)
-    const force3 = dataView.getInt32(12, true) // index 3 — front-right (J2)
-    const force4 = dataView.getInt32(16, true) // index 4 — back (J4)
-    const force5 = dataView.getInt32(20, true) // index 5 — front-left (J5)
+    const force0 = dataView.getInt32(0, true) // index 0
+    const force1 = dataView.getInt32(4, true) // index 1
+    const force2 = dataView.getInt32(8, true) // index 2
+    const force3 = dataView.getInt32(12, true) // index 3
+    const force4 = dataView.getInt32(16, true) // index 4
+    const force5 = dataView.getInt32(20, true) // index 5
 
     // Accel — packed as milli-g, so /1000 yields g
     const accelX = dataView.getInt32(24, true) / 1000 // index 6

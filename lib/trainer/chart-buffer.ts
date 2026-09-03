@@ -1,8 +1,8 @@
 /**
  * The Trainer tab's live chart trace buffer.
  *
- * `handleBikeData` in components/trainer-panel.tsx pushes one point per bike-
- * data notification and trims the front once the buffer grows past
+ * TrainerController's `handleBikeData` (lib/trainer/controller.ts) pushes one
+ * point per bike-data notification and trims the front once the buffer grows past
  * CHART_MAX_POINTS, so the chart shows a rolling ~10 minutes at 1 Hz rather
  * than growing without bound across a long session. Pulled out so the trim
  * boundary (the 601st point drops the 1st, not the other way round) is

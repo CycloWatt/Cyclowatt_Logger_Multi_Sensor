@@ -1,12 +1,13 @@
 /**
- * What the panel has actually put on the wire, not what the current mode
- * would send. Protocol mode needs no flag: protocolTargetW is already null
- * until the runner runs. Manual power needs manualTargetSent because the
- * slider value exists before Send is pressed - see trainer-panel.tsx.
+ * What has actually been put on the wire, not what the current mode would
+ * send. Protocol mode needs no flag: protocolTargetW is already null until
+ * the runner runs. Manual power needs manualTargetSent because the slider
+ * value exists before anything is written - see markManualTargetSent in
+ * lib/trainer/controller.ts.
  */
 
 import { clampToRange, type SupportedRange } from "../ftms/protocol"
-import type { TrainerMode } from "./session-log"
+import type { TrainerMode } from "./mode"
 import { runnerView, type RunnerState } from "./protocol-runner"
 
 /**

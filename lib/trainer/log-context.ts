@@ -1,14 +1,11 @@
 /**
- * The protocol/step-index context a log row carries, factored out of the
- * panel so it can be unit-tested without a DOM or a live runner. Pure
- * functions of the same values the panel already tracks in refs (mode,
- * protocolName, runner) - kept here as parameters rather than reading refs
- * directly, since the notification path (handleBikeData -> logEvent) must
- * read refs and never state, but startRecording (a plain click handler)
- * reads state instead - see trainer-panel.tsx call sites.
+ * The protocol/step-index context a log row carries, factored out so it can
+ * be unit-tested without a DOM or a live runner. Pure functions of values
+ * TrainerController holds as fields (mode, protocolName, runner) - see its
+ * logEvent and handleBikeData call sites in lib/trainer/controller.ts.
  */
 
-import type { TrainerMode } from "./session-log"
+import type { TrainerMode } from "./mode"
 import type { RunnerState } from "./protocol-runner"
 
 /**

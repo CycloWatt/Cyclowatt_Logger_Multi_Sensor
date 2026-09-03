@@ -46,15 +46,6 @@ import { openFtmsSession } from "@/lib/ftms/control"
 import { TrainerController, type TrainerSnapshot } from "@/lib/trainer/controller"
 
 export interface UseTrainerControllerOptions {
-  /**
-   * bluetoothSupported && isSecureContext, from the page.
-   *
-   * Part of the shape because it is what the panel is handed, but NOT read
-   * here: `connect()`'s "not supported" error is modelled on a call-time
-   * `bluetoothAvailable()` dep (this render also runs in node during the static
-   * export), and the prop itself only greys out the panel's own buttons.
-   */
-  bluetoothAvailable: boolean
   /** The connected CycloWatt board, so the trainer chooser can reject it. */
   boardDeviceId: string | null
 }
