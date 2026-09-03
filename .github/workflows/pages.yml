@@ -9,7 +9,7 @@ on:
   push:
     # Deliberately the working branch, not main: main has none of the firmware
     # update code, so a site built from it would have no update path at all.
-    branches: [test_bench_improvements]
+    branches: [main]
   workflow_dispatch:
 
 # contents:read is the checkout; pages:write publishes; id-token:write is the
