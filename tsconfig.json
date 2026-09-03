@@ -11,8 +11,19 @@
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "jsx": "preserve",
+    "jsx": "react-jsx",
     "incremental": true,
+    // TypeScript 6.0 changed the default of `types` from "every package under
+    // node_modules/@types" to [] (release notes, "types now defaults to []":
+    // https://www.typescriptlang.org/docs/handbook/release-notes/typescript-6-0.html),
+    // so the globals-only packages @types/web-bluetooth and @types/w3c-web-serial
+    // (BluetoothDevice, navigator.bluetooth, SerialPort, ...) must be listed
+    // explicitly. React and Node types still arrive through imports and Next's
+    // own references, so nothing else belongs here.
+    // `jsx: react-jsx` and the `.next/dev/types` include are NOT TypeScript 7
+    // requirements: they are the edits `next build` writes into this file on
+    // every run, committed so the build stops dirtying the working tree.
+    "types": ["web-bluetooth", "w3c-web-serial"],
     "plugins": [
       {
         "name": "next"
@@ -22,6 +33,6 @@
       "@/*": ["./*"]
     }
   },
-  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts", ".next/dev/types/**/*.ts"],
   "exclude": ["node_modules"]
 }
