@@ -45,6 +45,7 @@ import {
   forceDataKey,
 } from "@/lib/raw-stream/force-channels"
 import { DfuCard } from "@/components/dfu-card"
+import { TrainerPanel } from "@/components/trainer-panel"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 
 // Per-packet console output (3 lines per packet at streaming rate, i.e.
@@ -1735,9 +1736,10 @@ export default function BluetoothDataLogger() {
         )}
 
         <Tabs defaultValue="streaming">
-          <TabsList className="grid w-full max-w-md grid-cols-2">
+          <TabsList className="grid w-full max-w-md grid-cols-3">
             <TabsTrigger value="streaming">Data Streaming</TabsTrigger>
             <TabsTrigger value="firmware">Firmware Update</TabsTrigger>
+            <TabsTrigger value="trainer">Trainer</TabsTrigger>
           </TabsList>
 
           {/* Both panels are forceMount-ed: an in-flight DFU flow and the recorded
@@ -2113,6 +2115,15 @@ export default function BluetoothDataLogger() {
               stopStreaming={stopDataStreaming}
               deviceName={connectedName?.id === device?.id ? connectedName?.name : null}
               onDeviceName={handleFlashedDeviceName}
+            />
+          </TabsContent>
+
+          {/* forceMount for the same reason the DFU panel gives above: a running
+              protocol and the recorded session log must survive tab switches. */}
+          <TabsContent value="trainer" forceMount className="mt-4 space-y-6 data-[state=inactive]:hidden">
+            <TrainerPanel
+              bluetoothAvailable={bluetoothSupported && isSecureContext}
+              boardDeviceId={device?.id ?? null}
             />
           </TabsContent>
         </Tabs>
