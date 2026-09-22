@@ -1,6 +1,10 @@
 import type { Config } from 'tailwindcss'
 
-// all in fixtures is set to tailwind v3 as interims solutions
+// Tailwind v4 reads this file only because app/globals.css names it via
+// `@config`. That is v4's compatibility path for a v3-style JS config: the theme
+// below keeps working unchanged, so the shadcn hsl(var(--token)) system and the
+// tailwindcss-animate plugin need no rewrite into a CSS-first `@theme` block.
+// Migrating the theme into globals.css is possible later; nothing forces it.
 
 const config: Config = {
   darkMode: 'class',
