@@ -23,7 +23,24 @@ jobs:
   claude-review:
     # Fork PRs don't receive secrets: CLAUDE_CODE_OAUTH_TOKEN would resolve empty
     # and the job would fail red on every fork PR.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    #
+    # Dependabot is excluded for the same underlying reason, which the fork test
+    # does not catch: its branches live in THIS repo, so they pass the check above
+    # and the job runs. Two things then break, in order:
+    #   1. claude-code-action refuses bot actors outright — "Workflow initiated by
+    #      non-human actor: dependabot (type: Bot)".
+    #   2. Even allowing the bot would not help, because a dependabot-triggered run
+    #      reads secrets from the DEPENDABOT secret store rather than the Actions
+    #      one, and that store is empty here — the token would resolve to "" and
+    #      the step would die at startup instead.
+    # The result was a permanently red check on every dependency PR (#30-#35 all
+    # carried it), which is exactly the noise that trains people to merge past red.
+    # Skipping is also the honest answer: a lockfile bump is not a code review, and
+    # this job waits on CI for up to 15 minutes before even starting one. The
+    # dependency change stays gated — the `test` workflow runs on these PRs as usual.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     # Must cover the CI wait (below, 15 min cap) plus the review itself.
     timeout-minutes: 45
