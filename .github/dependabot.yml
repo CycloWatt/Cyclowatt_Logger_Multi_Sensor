@@ -19,9 +19,6 @@ updates:
         patterns:
           - "@radix-ui/*"
 
-    ignore:
-      # @types/node must describe the Node major that CI and the Pages deploy
-      # actually run (node-version in ci.yml / pages.yml). A newer major would
-      # type-check APIs the runtime does not have. Bump both together, by hand.
-      - dependency-name: "@types/node"
-        update-types: ["version-update:semver-major"]
+    # @types/node majors are deliberately NOT ignored: that PR is the only
+    # notice of a new Node line. ci.yml fails it until node-version in the
+    # workflows is bumped along with it.

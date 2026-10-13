@@ -30,12 +30,25 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # Keep in step with the other workflow and the @types/node major in
-          # package.json (dependabot.yml holds @types/node majors back for this).
+          # Keep in step with pages.yml and the @types/node major in
+          # package.json - the step after `npm ci` enforces the latter.
           node-version: 24
           cache: npm
 
       - run: npm ci
+
+      # @types/node must describe the Node major this job runs, or tsc accepts
+      # APIs the runtime lacks. Dependabot cannot bump node-version, so its
+      # @types/node major PR is the only notice that a new Node line exists:
+      # this turns that PR red with instructions instead of hiding it.
+      - name: Check @types/node matches the Node runtime
+        run: |
+          types=$(node -p "require('@types/node/package.json').version.split('.')[0]")
+          runtime=$(node -p "process.versions.node.split('.')[0]")
+          if [ "$types" != "$runtime" ]; then
+            echo "::error::@types/node is v$types but CI runs Node $runtime. If Node $types is an LTS line, set node-version: $types in ci.yml and pages.yml in this PR. If not, comment '@dependabot ignore this major version'."
+            exit 1
+          fi
 
       # Not `npm run lint`: that script says `eslint .` but eslint is neither a
       # devDependency nor configured in this repo, so it fails everywhere. Add
