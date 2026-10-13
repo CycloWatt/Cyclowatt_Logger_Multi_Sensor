@@ -33,7 +33,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Keep in step with the other workflow and the @types/node major in
+          # package.json (dependabot.yml holds @types/node majors back for this).
+          node-version: 24
           cache: npm
 
       - run: npm ci

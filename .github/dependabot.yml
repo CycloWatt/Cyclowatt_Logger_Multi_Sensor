@@ -9,3 +9,19 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+
+    # The @radix-ui packages share internal helpers (primitive, react-slot,
+    # react-presence, ...). Bumped one at a time, every bump nests its own newer
+    # copy of those helpers next to the old ones the other packages still use.
+    # One PR for the whole family keeps them in step and the lockfile deduped.
+    groups:
+      radix-ui:
+        patterns:
+          - "@radix-ui/*"
+
+    ignore:
+      # @types/node must describe the Node major that CI and the Pages deploy
+      # actually run (node-version in ci.yml / pages.yml). A newer major would
+      # type-check APIs the runtime does not have. Bump both together, by hand.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
