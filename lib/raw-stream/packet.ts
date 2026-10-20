@@ -96,13 +96,14 @@ export function parseDataPacket(dataView: DataView, ctx: PacketContext): DataPoi
     const gyroZ = dataView.getInt32(44, true) / 1000 // index 11
 
     // Power — frozen zero-fill slot, never a reading (see chartConfig.power).
-    // Parsed and exported anyway so the CSV column set stays stable.
+    // Parsed and exported anyway: logger-fw's cyclowatt.csv has a `power`
+    // column, and the CSV export mirrors that schema.
     const power = dataView.getInt32(48, true) // index 12
 
     // Tick — raw integer
     const tick = dataView.getInt32(52, true) // index 13
 
-    // ticks_mcu is a uint64 split into low/high uint32
+    // ticksMcu (CSV column tick_mcu) is a uint64 split into low/high uint32
     const ticksLow = dataView.getUint32(56, true) // index 14 — lower 32 bits
     const ticksHigh = dataView.getUint32(60, true) // index 15 — upper 32 bits
     const ticksMcu = Number((BigInt(ticksHigh) << 32n) | BigInt(ticksLow))

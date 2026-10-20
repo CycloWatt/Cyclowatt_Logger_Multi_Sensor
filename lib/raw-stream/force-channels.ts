@@ -17,8 +17,8 @@
  *     `Vout_meas_1..6` (AIN7/1/5/4/3/6).
  *   - `src/services/raw_stream_wire.c` packs slot i to wire slot i verbatim.
  * The logger chain is the odd one out and deliberately so: `parse_cyclowatt` in
- * logger-fw applies `FORCE_PERM = [0,3,1,4,2,5]` to regroup the wire order into
- * its per-sensor CSV columns. So this app's `forceN` (charts, DataPoint, this
+ * logger-fw regroups the wire order by `[0,3,1,4,2,5]` into its per-sensor CSV
+ * columns. So this app's `forceN` (charts, DataPoint, this
  * table) is logger WIRE index N, not logger column N. The CSV export is the one
  * place this app regroups too: lib/raw-stream/csv.ts writes logger-fw's columns
  * with the same permutation, so an exported file reads like the logger's.

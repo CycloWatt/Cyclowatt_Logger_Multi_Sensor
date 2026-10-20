@@ -19,12 +19,13 @@
  *     and so does this table - the same `[0,3,1,4,2,5]` as `parse_cyclowatt`.
  *   - `cw_time` is this PC's wall clock when the notification arrived, the
  *     browser's stand-in for the logger's `time.time()`. It skips the logger's
- *     dongle-to-UART hop, so against a Python-captured srm.csv expect an
- *     offset of a few ms, not zero.
+ *     dongle-to-UART hop, so against a logger-captured cw_time expect a small,
+ *     unmeasured offset, not zero.
  *   - `synch` has the logger's ROLE but not its values: the logger writes the
  *     CW dongle's button pin byte (0/1), this app the latest number read from
- *     the Web Serial sync cable (hooks/use-serial-sync.ts; 0 while it is not
- *     connected). Do not mix the two sources in one alignment.
+ *     the Web Serial sync cable (hooks/use-serial-sync.ts: 0 until the first
+ *     line arrives and after a manual disconnect; a cable lost mid-run keeps
+ *     its last value). Do not mix the two sources in one alignment.
  *   - `reference_power` (the trainer's power) has no logger column and is
  *     appended LAST, so every logger column keeps its position and a reader
  *     that selects by name never sees it.
@@ -35,8 +36,9 @@
  * silently lose resolution the capture actually has. The one exception is
  * `cw_time`, a join key, which uses the trainer log's fixed 3-decimal format;
  * an integer millisecond count divided by 1000 loses nothing at 3 decimals.
- * The logger's own file differs only in ways no CSV reader sees (`\r\n`
- * line ends, `1.0` where this writes `1`).
+ * The logger's own file differs only in ways no CSV reader trips over: `\r\n`
+ * line ends, `1.0` where this writes `1`, and `cw_time` at Python's full float
+ * precision where this writes 3 decimals (a browser clock has no more).
  */
 
 import { formatEpochSeconds } from "../trainer/session-log"
@@ -78,19 +80,30 @@ export function rawStreamToCsv(points: readonly DataPoint[]): string {
   ].join("\n")
 }
 
+/** Two digits, zero-padded - for the local-time pieces of the filename. */
+function pad2(n: number): string {
+  return String(n).padStart(2, "0")
+}
+
 /**
- * `<YYYY-MM-DD>[_fw<version>]_cyclowatt.csv`.
+ * `<YYYY-MM-DD>_<HHMMSS>[_fw<version>]_cyclowatt.csv`, in LOCAL time.
  *
  * It ENDS in `cyclowatt.csv` because that is how power-analysis-suite finds the
  * CW source in a take folder (`"file_glob": "*cyclowatt.csv"`), so a download
  * can be dropped next to the logger's files without a rename.
  *
- * The date is the UTC calendar day (the ISO string's date part), and the
- * firmware version is stamped into the FILENAME only - the CSV content stays
- * byte-identical - so a bench capture is attributable to a build.
+ * The time of day is there for the same glob: with a date alone, the second
+ * export of a bench day collides and the browser saves it as
+ * `..._cyclowatt (1).csv` - which the glob no longer matches. Local rather than
+ * UTC because this is the name a person picks a file by in a downloads folder
+ * (the trainer log's filename does the same, lib/trainer/session-log.ts).
+ *
+ * The firmware version is stamped into the FILENAME only - the CSV content
+ * stays byte-identical - so a bench capture is attributable to a build.
  */
 export function rawCsvFilename(date: Date, fwVersion: string | null): string {
-  const timestampPart = date.toISOString().split("T")[0]
+  const day = `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+  const time = `${pad2(date.getHours())}${pad2(date.getMinutes())}${pad2(date.getSeconds())}`
   const versionTag = fwVersion ? `_fw${fwVersion}` : ""
-  return `${timestampPart}${versionTag}_cyclowatt.csv`
+  return `${day}_${time}${versionTag}_cyclowatt.csv`
 }

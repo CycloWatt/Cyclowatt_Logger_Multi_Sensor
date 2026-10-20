@@ -21,7 +21,8 @@ const point = (over: Partial<DataPoint> = {}): DataPoint => ({
   gyroZ: 0,
   power: 7,
   referencePower: 150,
-  synchronization: 3,
+  // Distinct from every other cell, so a mix-up with any column shows.
+  synchronization: 8,
   ...over,
 })
 
@@ -88,7 +89,7 @@ describe("rawStreamToCsv", () => {
       "7",
       "99",
       "4294967296",
-      "3",
+      "8",
       "150",
     ])
   })
@@ -106,17 +107,41 @@ describe("rawStreamToCsv", () => {
     expect(row.force3_channel2).toBe("6")
   })
 
-  it("pins the logger column order from the wire bytes, not from DataPoint fields", () => {
-    // Same bytes through both decoders: parse_cyclowatt on this payload yields
-    // force = [10, 13, 11, 14, 12, 15].
+  it("writes the row logger-fw parse_cyclowatt writes for the same wire bytes", () => {
+    // All 16 slots distinct, negative forces, a tick_mcu high word. The expected
+    // cells are parse_cyclowatt's output on these bytes plus a trailing pin byte
+    // of 1 (it takes 65), recorded 2026-10-20 by running logger-fw's Python.
+    const slots = [1201, -1302, 1403, -1504, 1605, -1706, 12, -998, 1003, -250, 4, 31416, 0, 77, 0x89abcdef | 0, 3]
     const view = new DataView(new ArrayBuffer(EXPECTED_PACKET_SIZE))
-    ;[10, 11, 12, 13, 14, 15].forEach((value, slot) => view.setInt32(slot * 4, value, true))
-    const parsed = parseDataPacket(view, { timestamp: new Date(0), referencePower: 0, synchronization: 0 })
+    slots.forEach((value, slot) => view.setInt32(slot * 4, value, true))
+    const parsed = parseDataPacket(view, {
+      timestamp: new Date(1_767_225_907_300),
+      referencePower: 250,
+      synchronization: 1,
+    })
     expect(parsed).not.toBeNull()
 
-    const row = firstRowByHeader(rawStreamToCsv([parsed as DataPoint]))
-    const forceColumns = RAW_CSV_HEADERS.filter((name) => name.startsWith("force"))
-    expect(forceColumns.map((name) => row[name])).toEqual(["10", "13", "11", "14", "12", "15"])
+    const cells = rawStreamToCsv([parsed as DataPoint]).split("\n")[1].split(",")
+    expect(cells).toEqual([
+      "1767225907.300",
+      "1201",
+      "-1504",
+      "-1302",
+      "1605",
+      "1403",
+      "-1706",
+      "0.012",
+      "-0.998",
+      "1.003",
+      "-0.25",
+      "0.004",
+      "31.416",
+      "0",
+      "77",
+      "15194639855",
+      "1",
+      "250",
+    ])
   })
 
   it("writes cw_time as epoch seconds with exactly 3 decimals", () => {
@@ -149,23 +174,38 @@ describe("rawStreamToCsv", () => {
 })
 
 describe("rawCsvFilename", () => {
-  it("stamps the UTC date", () => {
-    expect(rawCsvFilename(new Date("2026-09-02T14:30:00Z"), null)).toBe("2026-09-02_cyclowatt.csv")
+  // Local-time constructor, so the expectations hold in any test timezone.
+  const at = new Date(2026, 8, 2, 14, 30, 5)
+
+  it("stamps the local date and time of day", () => {
+    expect(rawCsvFilename(at, null)).toBe("2026-09-02_143005_cyclowatt.csv")
+  })
+
+  it("zero-pads every date and time field", () => {
+    expect(rawCsvFilename(new Date(2026, 0, 3, 4, 5, 6), null)).toBe("2026-01-03_040506_cyclowatt.csv")
   })
 
   it("appends the firmware tag when a version is known", () => {
     // The version goes in the FILENAME only - the CSV content stays
     // byte-identical - so a bench capture is attributable to a build.
-    expect(rawCsvFilename(new Date("2026-09-02T14:30:00Z"), "1.4.2")).toBe("2026-09-02_fw1.4.2_cyclowatt.csv")
+    expect(rawCsvFilename(at, "1.4.2")).toBe("2026-09-02_143005_fw1.4.2_cyclowatt.csv")
   })
 
   it("omits the tag for an empty version string", () => {
-    expect(rawCsvFilename(new Date("2026-09-02T14:30:00Z"), "")).toBe("2026-09-02_cyclowatt.csv")
+    expect(rawCsvFilename(at, "")).toBe("2026-09-02_143005_cyclowatt.csv")
   })
 
   it("ends in cyclowatt.csv so PAS's *cyclowatt.csv glob picks it up", () => {
     // power-analysis-suite templates/session/schema_map.json finds the CW
     // source by "file_glob": "*cyclowatt.csv"; any other ending is invisible to it.
-    expect(rawCsvFilename(new Date("2026-09-02T14:30:00Z"), "1.4.2").endsWith("cyclowatt.csv")).toBe(true)
+    expect(rawCsvFilename(at, "1.4.2").endsWith("cyclowatt.csv")).toBe(true)
+  })
+
+  it("names two exports of the same day differently", () => {
+    // Same name twice makes the browser save "..._cyclowatt (1).csv", which
+    // the glob above no longer matches.
+    expect(rawCsvFilename(new Date(2026, 8, 2, 9, 0, 0), null)).not.toBe(
+      rawCsvFilename(new Date(2026, 8, 2, 16, 45, 0), null),
+    )
   })
 })

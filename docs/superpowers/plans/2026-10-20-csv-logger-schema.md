@@ -19,7 +19,7 @@
 - `cw_time` = `formatEpochSeconds(point.timestamp)` aus `lib/trainer/session-log.ts` (Epoch-Sekunden, PC-Uhr, genau 3 Nachkommastellen). Das ist dieselbe Uhr wie Pythons `time.time()` und derselbe Formatter, den der Trainer-Export schon für den `cw_time`-Join nutzt.
 - `synch` = `point.synchronization`. Gleiche Rolle, andere Quelle, **nicht austauschbare Werte**: der Logger schreibt das Button-Pin-Byte des CW-Dongles (0/1, `logger-fw/doc/architecture.md`), das Dashboard den letzten `parseFloat`-Wert des Web-Serial-Sync-Kabels (`hooks/use-serial-sync.ts`, 0 ohne Verbindung). Steht so im Modulkommentar.
 - `reference_power` bleibt erhalten, als **18. und letzte** Spalte. Es gibt dafür keine Logger-Spalte. Weglassen würde die Trainer-Referenz aus jeder Bench-Aufnahme löschen; als angehängte Spalte stört sie keinen Leser: PAS (`templates/session/schema_map.json`) und `logger-fw/scripts/remap_force_channels.py` wählen per Name bzw. verlangen einen exakten Header (letzteres schützt sogar davor, eine Dashboard-Datei doppelt zu permutieren).
-- Dateiname: `<UTC-Datum>[_fw<v>]_cyclowatt.csv` (z.B. `2026-10-20_fw1.4.2_cyclowatt.csv`). Grund: PAS findet die CW-Quelle per `"file_glob": "*cyclowatt.csv"`; der alte Name `cyclowatt_data_….csv` matcht nie. Die Firmware-Version bleibt im Namen.
+- Dateiname: `<YYYY-MM-DD>_<HHMMSS>[_fw<v>]_cyclowatt.csv` in Ortszeit (z.B. `2026-10-20_143005_fw1.4.2_cyclowatt.csv`). Die Uhrzeit ist Pflicht (Code-Review): mit Datum allein speichert der Browser den zweiten Export des Tages als `..._cyclowatt (1).csv`, und der Glob greift nicht mehr. Grund: PAS findet die CW-Quelle per `"file_glob": "*cyclowatt.csv"`; der alte Name `cyclowatt_data_….csv` matcht nie. Die Firmware-Version bleibt im Namen.
 - Unverändert: `\n` als Zeilentrenner, kein Newline am Dateiende, JS-Standard-Zahlformat (kein Runden). Python schreibt `\r\n` und `1.0` statt `1` — für pandas/`csv.reader` gleichwertig, bewusst kein Ziel.
 - Import innerhalb `lib/` **relativ** (`../trainer/session-log`): ohne vitest-Config löst vitest `@/` nicht auf (Value-Imports zwischen lib-Modulen sind im Repo durchweg relativ).
 - Kein Abwärtskompatibilitäts-Schalter, keine alten Spaltennamen. Kein Repo im Workspace liest das alte Schema (geprüft per grep über `cw-repos` nach `ticks_mcu`, `force_0`, `reference_power`, `cyclowatt_data_`).
@@ -46,7 +46,7 @@
 - Produces (Signaturen unverändert, nur Inhalt neu):
   - `export const RAW_CSV_HEADERS: readonly string[]` — abgeleitet aus der Spaltentabelle, 18 Einträge.
   - `export function rawStreamToCsv(points: readonly DataPoint[]): string`
-  - `export function rawCsvFilename(date: Date, fwVersion: string | null): string` — Signatur gleich, liefert `<YYYY-MM-DD>[_fw<v>]_cyclowatt.csv`.
+  - `export function rawCsvFilename(date: Date, fwVersion: string | null): string` — Signatur gleich, liefert `<YYYY-MM-DD>_<HHMMSS>[_fw<v>]_cyclowatt.csv` (Ortszeit).
   - Die Spaltentabelle selbst bleibt modul-privat (`const RAW_CSV_COLUMNS: readonly { header: string; cell: (p: DataPoint) => string | number }[]`).
 
 - [ ] **Step 1: Tests auf das neue Schema umschreiben (`lib/raw-stream/csv.test.ts`)**
