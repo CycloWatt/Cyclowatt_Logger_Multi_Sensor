@@ -17,9 +17,11 @@
  *     `Vout_meas_1..6` (AIN7/1/5/4/3/6).
  *   - `src/services/raw_stream_wire.c` packs slot i to wire slot i verbatim.
  * The logger chain is the odd one out and deliberately so: `parse_cyclowatt` in
- * logger-fw applies `FORCE_PERM = [0,3,1,4,2,5]` to regroup the wire order into
- * its per-sensor CSV columns. So this app's `force_N` is logger WIRE index N, not
- * logger column N - see the cross-check in the plan's verification notes.
+ * logger-fw regroups the wire order by `[0,3,1,4,2,5]` into its per-sensor CSV
+ * columns. So this app's `forceN` (charts, DataPoint, this
+ * table) is logger WIRE index N, not logger column N. The CSV export is the one
+ * place this app regroups too: lib/raw-stream/csv.ts writes logger-fw's columns
+ * with the same permutation, so an exported file reads like the logger's.
  *
  * SLOT -> POSITION comes from the schematic (`cyclowatt_pcb_v3.pdf` sheet 3),
  * which labels three amplifier columns `Force Sensor 1/2/3` on connectors
@@ -99,7 +101,8 @@ export const FORCE_CHANNELS: readonly ForceChannel[] = [
 ]
 
 /**
- * The chart/CSV key for a slot.
+ * The chart / DataPoint key for a slot. (The CSV export has its own per-sensor
+ * column names - see lib/raw-stream/csv.ts.)
  *
  * Exists so the six key strings are derived in one place rather than retyped at
  * every chart definition - a mistyped `force4` for `force5` is invisible in a
