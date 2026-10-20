@@ -21,14 +21,18 @@
  *     browser's stand-in for the logger's `time.time()`. It skips the logger's
  *     dongle-to-UART hop, so against a logger-captured cw_time expect a small,
  *     unmeasured offset, not zero.
- *   - `synch` has the logger's ROLE but not its values: the logger writes the
- *     CW dongle's button pin byte (0/1), this app the latest number read from
- *     the Web Serial sync cable (hooks/use-serial-sync.ts: 0 until the first
- *     line arrives and after a manual disconnect; a cable lost mid-run keeps
- *     its last value). Do not mix the two sources in one alignment.
- *   - `reference_power` (the trainer's power) has no logger column and is
- *     appended LAST, so every logger column keeps its position and a reader
- *     that selects by name never sees it.
+ *   - `synch` IS ALWAYS 0. The logger writes the CW dongle's sync button pin
+ *     byte there, and power-analysis-suite anchors `time_cw_sync_s` on the
+ *     FIRST 0 -> non-zero step in it (preprocess_map.json, `self_rising_flag`).
+ *     There is no sync event at the dashboard, so the honest value is the
+ *     logger's "button never pressed": the file loads, and any step that needs
+ *     the sync clock fails loudly ("could not find a 0->non-zero transition")
+ *     instead of anchoring on whatever the serial input happened to read.
+ *   - Two columns have no logger counterpart and are appended LAST, so every
+ *     logger column keeps its position and a reader that selects by name never
+ *     sees them: `reference_power` (the trainer's power) and `synchronization`
+ *     (the latest number from the Web Serial input, hooks/use-serial-sync.ts -
+ *     kept as recorded, deliberately NOT under the name `synch`).
  *
  * Cell formatting is deliberately plain JavaScript number-to-string: no fixed
  * decimals, no quoting, no escaping. Nothing in a DataPoint is a string or can
@@ -66,8 +70,9 @@ const RAW_CSV_COLUMNS: readonly RawCsvColumn[] = [
   { header: "power", cell: (p) => p.power },
   { header: "tick", cell: (p) => p.tick },
   { header: "tick_mcu", cell: (p) => p.ticksMcu },
-  { header: "synch", cell: (p) => p.synchronization },
+  { header: "synch", cell: () => 0 }, // no sync at the dashboard - see the module comment
   { header: "reference_power", cell: (p) => p.referencePower },
+  { header: "synchronization", cell: (p) => p.synchronization },
 ]
 
 export const RAW_CSV_HEADERS: readonly string[] = RAW_CSV_COLUMNS.map((column) => column.header)

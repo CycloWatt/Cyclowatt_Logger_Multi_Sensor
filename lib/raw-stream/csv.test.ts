@@ -34,7 +34,7 @@ const firstRowByHeader = (csv: string): Record<string, string> => {
 }
 
 describe("RAW_CSV_HEADERS", () => {
-  it("is logger-fw's 17 cyclowatt.csv columns, then reference_power", () => {
+  it("is logger-fw's 17 cyclowatt.csv columns, then reference_power and synchronization", () => {
     // The first 17 are copied from logger-fw srm_cw_logger_raw.py main() and
     // must stay byte-identical to it: power-analysis-suite maps exactly these
     // names (templates/session/schema_map.json). A change there is a change here.
@@ -57,6 +57,7 @@ describe("RAW_CSV_HEADERS", () => {
       "tick_mcu",
       "synch",
       "reference_power",
+      "synchronization",
     ])
   })
 })
@@ -66,7 +67,7 @@ describe("rawStreamToCsv", () => {
     expect(rawStreamToCsv([point()]).split("\n")[0]).toBe(RAW_CSV_HEADERS.join(","))
   })
 
-  it("writes one row per sample with the 18 cells in header order", () => {
+  it("writes one row per sample with the 19 cells in header order", () => {
     const csv = rawStreamToCsv([point()])
     const rows = csv.split("\n")
     expect(rows).toHaveLength(2)
@@ -89,9 +90,28 @@ describe("rawStreamToCsv", () => {
       "7",
       "99",
       "4294967296",
-      "8",
+      "0",
       "150",
+      "8",
     ])
+  })
+
+  it("writes synch as 0 whatever the serial input reads", () => {
+    // There is no sync event at the dashboard. PAS anchors time_cw_sync_s on
+    // the FIRST 0 -> non-zero step in synch (preprocess_map.json,
+    // self_rising_flag), so any non-zero value here would be taken for one and
+    // silently mis-anchor the take. A constant 0 makes PAS fail loudly instead.
+    const csv = rawStreamToCsv([
+      point({ synchronization: 0 }),
+      point({ synchronization: 5 }),
+      point({ synchronization: -2.5 }),
+    ])
+    const rows = csv.split("\n").slice(1).map((row) => row.split(","))
+    const synchIndex = RAW_CSV_HEADERS.indexOf("synch")
+    const serialIndex = RAW_CSV_HEADERS.indexOf("synchronization")
+    expect(rows.map((cells) => cells[synchIndex])).toEqual(["0", "0", "0"])
+    // The serial reading itself is kept, under a name PAS does not map.
+    expect(rows.map((cells) => cells[serialIndex])).toEqual(["0", "5", "-2.5"])
   })
 
   it("regroups the wire slots per sensor exactly like logger-fw parse_cyclowatt", () => {
@@ -110,7 +130,8 @@ describe("rawStreamToCsv", () => {
   it("writes the row logger-fw parse_cyclowatt writes for the same wire bytes", () => {
     // All 16 slots distinct, negative forces, a tick_mcu high word. The expected
     // cells are parse_cyclowatt's output on these bytes plus a trailing pin byte
-    // of 1 (it takes 65), recorded 2026-10-20 by running logger-fw's Python.
+    // of 0 (it takes 65; 0 = sync button never pressed, which is what the
+    // dashboard always writes), recorded 2026-10-20 by running logger-fw's Python.
     const slots = [1201, -1302, 1403, -1504, 1605, -1706, 12, -998, 1003, -250, 4, 31416, 0, 77, 0x89abcdef | 0, 3]
     const view = new DataView(new ArrayBuffer(EXPECTED_PACKET_SIZE))
     slots.forEach((value, slot) => view.setInt32(slot * 4, value, true))
@@ -139,8 +160,9 @@ describe("rawStreamToCsv", () => {
       "0",
       "77",
       "15194639855",
-      "1",
+      "0",
       "250",
+      "1",
     ])
   })
 
