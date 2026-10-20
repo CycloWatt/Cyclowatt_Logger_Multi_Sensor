@@ -34,7 +34,7 @@ const firstRowByHeader = (csv: string): Record<string, string> => {
 }
 
 describe("RAW_CSV_HEADERS", () => {
-  it("is logger-fw's 17 cyclowatt.csv columns, then reference_power and synchronization", () => {
+  it("is logger-fw's 17 cyclowatt.csv columns, then reference_power and serial_input", () => {
     // The first 17 are copied from logger-fw srm_cw_logger_raw.py main() and
     // must stay byte-identical to it: power-analysis-suite maps exactly these
     // names (templates/session/schema_map.json). A change there is a change here.
@@ -57,7 +57,7 @@ describe("RAW_CSV_HEADERS", () => {
       "tick_mcu",
       "synch",
       "reference_power",
-      "synchronization",
+      "serial_input",
     ])
   })
 })
@@ -108,10 +108,18 @@ describe("rawStreamToCsv", () => {
     ])
     const rows = csv.split("\n").slice(1).map((row) => row.split(","))
     const synchIndex = RAW_CSV_HEADERS.indexOf("synch")
-    const serialIndex = RAW_CSV_HEADERS.indexOf("synchronization")
+    const serialIndex = RAW_CSV_HEADERS.indexOf("serial_input")
     expect(rows.map((cells) => cells[synchIndex])).toEqual(["0", "0", "0"])
     // The serial reading itself is kept, under a name PAS does not map.
     expect(rows.map((cells) => cells[serialIndex])).toEqual(["0", "5", "-2.5"])
+  })
+
+  it("names no extra column so that it contains the substring synch", () => {
+    // PAS's find_column (adapters/common.py) falls back to a SUBSTRING match
+    // when the exact name is missing; a dashboard-only column containing
+    // "synch" would then be read as the sync flag. Only the real column may.
+    const extras = RAW_CSV_HEADERS.slice(17)
+    expect(extras.filter((name) => name.toLowerCase().includes("synch"))).toEqual([])
   })
 
   it("regroups the wire slots per sensor exactly like logger-fw parse_cyclowatt", () => {

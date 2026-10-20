@@ -30,9 +30,11 @@
  *     instead of anchoring on whatever the serial input happened to read.
  *   - Two columns have no logger counterpart and are appended LAST, so every
  *     logger column keeps its position and a reader that selects by name never
- *     sees them: `reference_power` (the trainer's power) and `synchronization`
- *     (the latest number from the Web Serial input, hooks/use-serial-sync.ts -
- *     kept as recorded, deliberately NOT under the name `synch`).
+ *     sees them: `reference_power` (the trainer's power) and `serial_input`
+ *     (the latest number from the Web Serial input, hooks/use-serial-sync.ts,
+ *     kept as recorded). That name must not contain "synch": PAS's
+ *     find_column falls back to a SUBSTRING match when an exact name is
+ *     missing, so a `synchronization` column could stand in for `synch`.
  *
  * Cell formatting is deliberately plain JavaScript number-to-string: no fixed
  * decimals, no quoting, no escaping. Nothing in a DataPoint is a string or can
@@ -72,7 +74,7 @@ const RAW_CSV_COLUMNS: readonly RawCsvColumn[] = [
   { header: "tick_mcu", cell: (p) => p.ticksMcu },
   { header: "synch", cell: () => 0 }, // no sync at the dashboard - see the module comment
   { header: "reference_power", cell: (p) => p.referencePower },
-  { header: "synchronization", cell: (p) => p.synchronization },
+  { header: "serial_input", cell: (p) => p.synchronization },
 ]
 
 export const RAW_CSV_HEADERS: readonly string[] = RAW_CSV_COLUMNS.map((column) => column.header)
