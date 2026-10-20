@@ -114,12 +114,13 @@ describe("rawStreamToCsv", () => {
     expect(rows.map((cells) => cells[serialIndex])).toEqual(["0", "5", "-2.5"])
   })
 
-  it("names no extra column so that it contains the substring synch", () => {
+  it("names no extra column so that it contains the substring sync", () => {
     // PAS's find_column (adapters/common.py) falls back to a SUBSTRING match
     // when the exact name is missing; a dashboard-only column containing
-    // "synch" would then be read as the sync flag. Only the real column may.
+    // "synch" would then be read as the sync flag. Checked on the broader
+    // "sync" so a future alias spelled that way is covered too.
     const extras = RAW_CSV_HEADERS.slice(17)
-    expect(extras.filter((name) => name.toLowerCase().includes("synch"))).toEqual([])
+    expect(extras.filter((name) => name.toLowerCase().includes("sync"))).toEqual([])
   })
 
   it("regroups the wire slots per sensor exactly like logger-fw parse_cyclowatt", () => {

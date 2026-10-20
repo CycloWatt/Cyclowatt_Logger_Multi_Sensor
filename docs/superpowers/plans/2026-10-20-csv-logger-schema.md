@@ -51,6 +51,8 @@
 
 - [ ] **Step 1: Tests auf das neue Schema umschreiben (`lib/raw-stream/csv.test.ts`)**
 
+  > **Überholt durch die Umsetzung (PR #63):** Die Spaltenliste hat inzwischen 19 Einträge. `synch` ist immer 0, und `serial_input` ist die 19. Spalte (siehe Global Constraints). Die Testfälle und Erwartungswerte unten sind der ursprüngliche Plan; maßgeblich ist `csv.test.ts`.
+
   - `describe("RAW_CSV_HEADERS")` → `it("is logger-fw's 17 cyclowatt.csv columns, then reference_power")`:
     `expect([...RAW_CSV_HEADERS]).toEqual([...17 Logger-Namen aus Global Constraints..., "reference_power"])`.
     Kommentar: Quelle ist `srm_cw_logger_raw.py` `main()`; Änderung dort = Änderung hier.
