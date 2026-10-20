@@ -1348,9 +1348,10 @@ export default function BluetoothDataLogger() {
     if (recorded.length === 0) return
 
     // Columns, rows and filename all live in lib/raw-stream/csv.ts, where the
-    // 17 header strings are pinned by test - bench analysis scripts select them
-    // by name. What is left here is the Blob/anchor download dance, which needs
-    // a document.
+    // header is pinned by test to logger-fw's cyclowatt.csv (plus
+    // reference_power) - power-analysis-suite reads both files the same way.
+    // What is left here is the Blob/anchor download dance, which needs a
+    // document.
     const csvContent = rawStreamToCsv(recorded)
 
     const blob = new Blob([csvContent], { type: "text/csv" })
