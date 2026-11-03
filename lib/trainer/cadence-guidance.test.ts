@@ -1,5 +1,5 @@
 import { expect, it } from "vitest"
-import { cadenceCue } from "./cadence-guidance"
+import { cadenceCue, selectGuidanceCadence } from "./cadence-guidance"
 import { validateSteps } from "./presets"
 it("cues only outside the five RPM tolerance", () => {
   expect(cadenceCue(90, 84)).toBe("Pedal faster")
@@ -17,4 +17,13 @@ it("allows legacy steps and rejects invalid cadence targets", () => {
   expect(validateSteps([{ ...step, targetCadenceRpm: 90 }])).toBeNull()
   expect(validateSteps([{ ...step, targetCadenceRpm: 0 }])).not.toBeNull()
   expect(validateSteps([{ ...step, targetCadenceRpm: NaN }])).not.toBeNull()
+})
+
+it("prefers SRM, falls back only to a connected fresh trainer, and preserves zero", () => {
+  const input = { srm: null, trainer: 85, trainerStale: false, connected: true }
+  expect(selectGuidanceCadence(input)).toBe(85)
+  expect(selectGuidanceCadence({...input,srm:90})).toBe(90)
+  expect(selectGuidanceCadence({...input,srm:0})).toBe(0)
+  expect(selectGuidanceCadence({...input,trainerStale:true})).toBeNull()
+  expect(selectGuidanceCadence({...input,connected:false})).toBeNull()
 })

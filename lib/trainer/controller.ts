@@ -964,12 +964,12 @@ export class TrainerController {
    * The `starting` FIELD is what actually holds the door, since two clicks in
    * one tick would both see the rendered snapshot's `starting` false.
    */
-  async startProtocol(): Promise<void> {
-    if (this.starting) return
+  async startProtocol(): Promise<boolean> {
+    if (this.starting) return false
     const problem = validateSteps(this.steps)
     if (problem !== null) {
       this.setError(`Cannot start the protocol: ${problem}.`)
-      return
+      return false
     }
     this.setError("")
     this.starting = true
@@ -980,11 +980,12 @@ export class TrainerController {
       // Queued so a Stop clicked a moment ago finishes its 0x08 before this
       // sequence's 0x07 - interleaved, the trainer could end up stopped while
       // the runner runs. The first step's target enqueues right behind it.
-      if (!(await this.queueControlSequence(() => this.ensureStarted()))) return
+      if (!(await this.queueControlSequence(() => this.ensureStarted()))) return false
       const nowMs = this.deps.now()
       const { state, events } = reduceRunner(fresh, { type: "start" }, nowMs)
       this.commitRunner(state)
       this.applyEvents(events, nowMs)
+      return true
     } finally {
       this.starting = false
       this.emit()

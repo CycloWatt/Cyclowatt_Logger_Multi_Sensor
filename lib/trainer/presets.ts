@@ -148,6 +148,7 @@ function isStoredStep(value: unknown): value is ProtocolStep {
   if (typeof value !== "object" || value === null) return false
   const step = value as Record<string, unknown>
   return typeof step.targetWatts === "number" && typeof step.durationSeconds === "number"
+    && (step.instruction === undefined || typeof step.instruction === "string")
     && (step.targetCadenceRpm === undefined || (typeof step.targetCadenceRpm === "number" && Number.isFinite(step.targetCadenceRpm) && step.targetCadenceRpm > 0))
 }
 

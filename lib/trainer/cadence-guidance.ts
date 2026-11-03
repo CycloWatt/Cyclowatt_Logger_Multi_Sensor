@@ -6,3 +6,10 @@ export function cadenceCue(target: number | undefined, measured: number | null):
   if (measured > target + 5) return "Pedal slower"
   return "On target"
 }
+
+export function selectGuidanceCadence({ srm, trainer, trainerStale, connected }: {
+  srm: number | null; trainer: number | null; trainerStale: boolean; connected: boolean
+}): number | null {
+  if (srm !== null && Number.isFinite(srm)) return srm
+  return connected && !trainerStale && trainer !== null && Number.isFinite(trainer) ? trainer : null
+}

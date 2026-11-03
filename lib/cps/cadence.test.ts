@@ -44,3 +44,13 @@ it("reacquires a baseline after a full event-clock period without movement", () 
   expect(cadence.update(packet(3, 2148), 67000)).toBeNull()
   expect(cadence.update(packet(4, 3172), 68000)).toBe(60)
 })
+
+it("keeps crank history across power-only packets and expires missing updates", () => {
+  const cadence = new ReferenceCadence()
+  const powerOnly = new DataView(new ArrayBuffer(4))
+  cadence.update(packet(1, 100), 1000)
+  expect(cadence.update(powerOnly, 1500)).toBeNull()
+  expect(cadence.update(packet(2, 1124), 2000)).toBe(60)
+  expect(cadence.update(powerOnly, 2500)).toBe(60)
+  expect(cadence.update(powerOnly, 5001)).toBeNull()
+})

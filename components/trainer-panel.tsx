@@ -26,7 +26,7 @@
  * an unrelated action - this panel keeps its own (`snapshot.error`).
  */
 
-import { cadenceCue } from "@/lib/trainer/cadence-guidance"
+import { cadenceCue, selectGuidanceCadence } from "@/lib/trainer/cadence-guidance"
 import { useEffect, useRef, useState } from "react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -76,7 +76,9 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
     setStreamStartError("")
     try {
       await onPrepareStreaming()
-      await controller.startProtocol()
+      if (!(await controller.startProtocol())) {
+        setStreamStartError("Trainer protocol did not start. CycloWatt CSV capture remains enabled; check the trainer error, then retry or stop streaming in Data Streaming.")
+      }
     } catch (error) {
       setStreamStartError(error instanceof Error ? error.message : "Could not start streaming.")
     } finally {
@@ -268,7 +270,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
   const cadenceTarget = mode === "protocol" && runner.status === "running"
     ? runner.protocol.steps[runner.stepIndex]?.targetCadenceRpm : undefined
   const srmCadence = getSrmCadence()
-  const guidanceCadence = srmCadence ?? (connected && !stale ? live?.cadenceRpm ?? null : null)
+  const guidanceCadence = selectGuidanceCadence({ srm: srmCadence, trainer: live?.cadenceRpm ?? null, trainerStale: stale, connected })
   const cadenceMessage = cadenceCue(cadenceTarget, guidanceCadence)
 
   const targetLabelText = targetLabel({ mode, manualTargetSent, manualResistancePct, liveTargetW: currentTargetW })

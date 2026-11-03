@@ -23,8 +23,9 @@ export class ReferenceCadence {
     if (flags & 4) offset += 2 // accumulated torque
     if (flags & 16) offset += 6 // wheel revolution data
     if (!(flags & 32) || view.byteLength < offset + 4) {
-      this.reset()
-      return null
+      // Optional crank data may be omitted between valid crank measurements.
+      // Keep the baseline and let value() expire the last actual crank event.
+      return this.value(now)
     }
     const current = { revolutions: view.getUint16(offset, true), time: view.getUint16(offset + 2, true) }
     const previous = this.previous
