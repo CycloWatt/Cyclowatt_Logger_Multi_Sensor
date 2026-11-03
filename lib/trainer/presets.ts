@@ -19,6 +19,7 @@ import type { StringStore } from "../flash-history"
  * one under TypeScript's structural typing, so callers can pass either.
  */
 export interface ProtocolStep {
+  targetCadenceRpm?: number
   targetWatts: number
   durationSeconds: number
 }
@@ -113,6 +114,7 @@ export function validateSteps(steps: readonly ProtocolStep[]): string | null {
     if (!Number.isFinite(step.targetWatts) || !Number.isFinite(step.durationSeconds)) {
       return "every step needs a real number for watts and duration"
     }
+    if (step.targetCadenceRpm !== undefined && (!Number.isFinite(step.targetCadenceRpm) || step.targetCadenceRpm <= 0)) return "target cadence must be a positive number or blank"
     if (step.targetWatts < 0) return "target watts cannot be negative"
     if (step.durationSeconds <= 0) return "step duration must be positive"
   }
@@ -142,6 +144,7 @@ function isStoredStep(value: unknown): value is ProtocolStep {
   if (typeof value !== "object" || value === null) return false
   const step = value as Record<string, unknown>
   return typeof step.targetWatts === "number" && typeof step.durationSeconds === "number"
+    && (step.targetCadenceRpm === undefined || (typeof step.targetCadenceRpm === "number" && Number.isFinite(step.targetCadenceRpm) && step.targetCadenceRpm > 0))
 }
 
 /** Is `value` shaped enough to trust as a stored user TrainerPreset? */

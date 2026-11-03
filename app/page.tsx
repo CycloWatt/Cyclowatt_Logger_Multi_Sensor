@@ -1843,6 +1843,7 @@ export default function BluetoothDataLogger() {
             <TrainerPanel
               bluetoothAvailable={bluetoothSupported && isSecureContext}
               boardDeviceId={device?.id ?? null}
+              getSrmCadence={() => refCadenceRef.current.value(Date.now())}
               boardReady={isConnected && characteristic !== null}
               boardStreaming={isStreaming}
               onPrepareStreaming={async () => {

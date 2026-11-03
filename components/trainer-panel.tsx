@@ -26,6 +26,7 @@
  * an unrelated action - this panel keeps its own (`snapshot.error`).
  */
 
+import { cadenceCue } from "@/lib/trainer/cadence-guidance"
 import { useEffect, useRef, useState } from "react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -48,6 +49,7 @@ export interface TrainerPanelProps {
   /** bluetoothSupported && isSecureContext, from the page. */
   bluetoothAvailable: boolean
   /** The connected CycloWatt board, so the trainer chooser can reject it. */
+  getSrmCadence: () => number | null
   boardReady: boolean
   boardStreaming: boolean
   onPrepareStreaming: () => Promise<void>
@@ -57,9 +59,10 @@ export interface TrainerPanelProps {
 /** Runner tick cadence while running; see the module comment on the other two sources. */
 const RUNNER_TICK_MS = 250
 
-export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, boardStreaming, onPrepareStreaming }: TrainerPanelProps) {
+export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, boardStreaming, onPrepareStreaming, getSrmCadence }: TrainerPanelProps) {
   /* The one collaborator that is not React, plus the mirror of its snapshot. */
   const { snapshot, controller } = useTrainerController({ boardDeviceId })
+  const [cadenceGuidance, setCadenceGuidance] = useState(true)
   const combinedStartLock = useRef(false)
   const [preparingStream, setPreparingStream] = useState(false)
   const [streamStartError, setStreamStartError] = useState("")
@@ -231,6 +234,12 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
   const stale = isStale(live?.receivedAtMs ?? null, nowTick)
   const currentTargetW = liveTargetW({ mode, runner, nowMs: nowTick || Date.now(), manualTargetSent, manualTargetW })
 
+  const cadenceTarget = mode === "protocol" && runner.status === "running"
+    ? runner.protocol.steps[runner.stepIndex]?.targetCadenceRpm : undefined
+  const srmCadence = getSrmCadence()
+  const guidanceCadence = srmCadence ?? (connected && !stale ? live?.cadenceRpm ?? null : null)
+  const cadenceMessage = cadenceCue(cadenceTarget, guidanceCadence)
+
   const targetLabelText = targetLabel({ mode, manualTargetSent, manualResistancePct, liveTargetW: currentTargetW })
   const stepLabelText = stepLabel({ mode, runnerStatus: runner.status, stepIndex: view.stepIndex, stepCount: view.stepCount })
   const elapsedLabelText = elapsedLabel({
@@ -269,6 +278,21 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
         onDisconnect={() => void controller.disconnect()}
         onTakeControl={() => void controller.takeControl()}
       />
+
+      <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input type="checkbox" checked={cadenceGuidance} onChange={(e) => setCadenceGuidance(e.target.checked)} />
+          Cadence guidance
+        </label>
+        {cadenceGuidance && <div className="mt-2" role="status">
+          <div className="text-2xl font-semibold">{cadenceMessage}</div>
+          {cadenceTarget !== undefined && <p className="text-sm mt-1">
+            Target {cadenceTarget} rpm · Current {guidanceCadence === null ? "—" : Math.round(guidanceCadence)} rpm
+            {guidanceCadence !== null && ` (${srmCadence !== null ? "SRM reference meter" : "trainer"})`} · Tolerance ±5 rpm
+          </p>}
+          <p className="text-xs text-gray-600 mt-1">Follow the cadence cue yourself; ERG controls power.</p>
+        </div>}
+      </div>
 
       <TrainerReadouts
         powerW={live?.powerW ?? null}
