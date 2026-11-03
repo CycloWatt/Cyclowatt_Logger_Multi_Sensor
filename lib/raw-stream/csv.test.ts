@@ -34,7 +34,7 @@ const firstRowByHeader = (csv: string): Record<string, string> => {
 }
 
 describe("RAW_CSV_HEADERS", () => {
-  it("is logger-fw's 17 cyclowatt.csv columns, then reference_power and serial_input", () => {
+  it("is logger-fw's 17 cyclowatt.csv columns, then reference_power, serial_input and srm_cadence", () => {
     // The first 17 are copied from logger-fw srm_cw_logger_raw.py main() and
     // must stay byte-identical to it: power-analysis-suite maps exactly these
     // names (templates/session/schema_map.json). A change there is a change here.
@@ -58,6 +58,7 @@ describe("RAW_CSV_HEADERS", () => {
       "synch",
       "reference_power",
       "serial_input",
+      "srm_cadence",
     ])
   })
 })
@@ -67,7 +68,7 @@ describe("rawStreamToCsv", () => {
     expect(rawStreamToCsv([point()]).split("\n")[0]).toBe(RAW_CSV_HEADERS.join(","))
   })
 
-  it("writes one row per sample with the 19 cells in header order", () => {
+  it("writes one row per sample with the 20 cells in header order", () => {
     const csv = rawStreamToCsv([point()])
     const rows = csv.split("\n")
     expect(rows).toHaveLength(2)
@@ -93,6 +94,7 @@ describe("rawStreamToCsv", () => {
       "0",
       "150",
       "8",
+      "",
     ])
   })
 
@@ -172,6 +174,7 @@ describe("rawStreamToCsv", () => {
       "0",
       "250",
       "1",
+      "",
     ])
   })
 
@@ -239,4 +242,10 @@ describe("rawCsvFilename", () => {
       rawCsvFilename(new Date(2026, 8, 2, 16, 45, 0), null),
     )
   })
+})
+
+it("exports SRM cadence in RPM and leaves unavailable readings blank", () => {
+  expect(firstRowByHeader(rawStreamToCsv([point({ srmCadence: 91.5 })])).srm_cadence).toBe("91.5")
+  expect(firstRowByHeader(rawStreamToCsv([point({ srmCadence: null })])).srm_cadence).toBe("")
+  expect(firstRowByHeader(rawStreamToCsv([point({ srmCadence: 0 })])).srm_cadence).toBe("0")
 })

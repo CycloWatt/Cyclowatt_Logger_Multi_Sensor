@@ -123,7 +123,7 @@ export function TrainerStepEditor({
   }
 
   /** One numeric cell: raw text until it parses, then a committed number. */
-  function handleCellChange(index: number, field: keyof ProtocolStep, text: string) {
+  function handleCellChange(index: number, field: "targetWatts" | "durationSeconds", text: string) {
     const key: CellKey = `${index}:${field}`
     const parsed = Number(text)
     if (text.trim() !== "" && Number.isFinite(parsed)) {
@@ -138,12 +138,12 @@ export function TrainerStepEditor({
     }
   }
 
-  function cellValue(index: number, field: keyof ProtocolStep): string {
+  function cellValue(index: number, field: "targetWatts" | "durationSeconds"): string {
     const key: CellKey = `${index}:${field}`
     return rawCells[key] ?? String(steps[index][field])
   }
 
-  function cellIsAmber(index: number, field: keyof ProtocolStep): boolean {
+  function cellIsAmber(index: number, field: "targetWatts" | "durationSeconds"): boolean {
     const key: CellKey = `${index}:${field}`
     if (rawCells[key] !== undefined) return true // mid-edit, not yet a valid number
     if (field === "targetWatts") {
@@ -274,12 +274,15 @@ export function TrainerStepEditor({
           </Button>
         </div>
 
+        {!selectedPreset?.manualGuide && <>
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead className="w-10">#</TableHead>
               <TableHead>Target (W)</TableHead>
               <TableHead>Duration (s)</TableHead>
+              <TableHead>Cadence (rpm, optional)</TableHead>
+              <TableHead>Rider instruction</TableHead>
               <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
@@ -309,6 +312,18 @@ export function TrainerStepEditor({
                     className={`h-8 w-24 text-xs tabular-nums ${cellIsAmber(index, "durationSeconds") ? "border-amber-500" : ""}`}
                   />
                 </TableCell>
+                <TableCell>
+                  <Input type="number" min="1" step="1" placeholder="Off"
+                    value={step.targetCadenceRpm ?? ""} disabled={disabled}
+                    aria-label={`Step ${index + 1} target cadence`}
+                    className="h-8 w-24 text-xs tabular-nums"
+                    onChange={(event) => replaceSteps(steps.map((item, i) => i === index
+                      ? { ...item, targetCadenceRpm: event.target.value === "" ? undefined : Number(event.target.value) }
+                      : item))} />
+                </TableCell>
+                <TableCell><Input aria-label={`Step ${index + 1} instruction`} value={step.instruction ?? ""}
+                  disabled={disabled} className="h-8 min-w-48 text-xs" placeholder="Optional cue"
+                  onChange={(event) => commitStep(index, { instruction: event.target.value })} /></TableCell>
                 <TableCell className="text-right">
                   <div className="flex justify-end gap-1">
                     <Button
@@ -420,6 +435,7 @@ export function TrainerStepEditor({
 
           {rampOpen && rampMessage && <p className="mt-2 text-sm text-amber-600">{rampMessage}</p>}
         </div>
+        </>}
       </CardContent>
     </Card>
   )

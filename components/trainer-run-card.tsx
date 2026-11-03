@@ -23,6 +23,9 @@ export interface TrainerRunCardProps {
   steps: ProtocolStep[]
   runnerStatus: RunnerStatus
   nextStep: ProtocolStep | null
+  boardReady: boolean
+  boardStreaming: boolean
+  onStartWithStreaming: () => void
   onStart: () => void
   onPause: () => void
   onResume: () => void
@@ -38,6 +41,9 @@ export function TrainerRunCard({
   runnerStatus,
   nextStep,
   onStart,
+  boardReady,
+  boardStreaming,
+  onStartWithStreaming,
   onPause,
   onResume,
   onSkip,
@@ -46,14 +52,26 @@ export function TrainerRunCard({
   return (
     <Card className="bg-white border-gray-200">
       <CardHeader>
-        <CardTitle>Run</CardTitle>
+        <CardTitle>Run protocol</CardTitle>
+        <p className="text-sm text-gray-500">
+          {boardReady
+            ? boardStreaming ? "CycloWatt is streaming. Start the protocol with CSV capture enabled." : "Start CycloWatt CSV capture and the trainer protocol together."
+            : "Connect a CycloWatt board in Data Streaming to start both together."}
+          {" "}Existing CycloWatt samples are kept. Stopping the protocol leaves CycloWatt recording until you stop it in Data Streaming.
+        </p>
       </CardHeader>
       <CardContent className="flex flex-wrap items-center gap-2">
         <Button
+          onClick={onStartWithStreaming}
+          disabled={!connected || !boardReady || protocolActive || starting || validateSteps(steps) !== null}
+        >
+          {starting ? "Starting…" : "Start protocol + streaming"}
+        </Button>
+        <Button variant="outline"
           onClick={onStart}
           disabled={!connected || protocolActive || starting || validateSteps(steps) !== null}
         >
-          {starting ? "Starting…" : "Start"}
+          Start protocol only
         </Button>
         <Button variant="outline" onClick={onPause} disabled={runnerStatus !== "running"}>
           Pause

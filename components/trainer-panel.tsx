@@ -26,11 +26,15 @@
  * an unrelated action - this panel keeps its own (`snapshot.error`).
  */
 
-import { useEffect, useState } from "react"
+import { cadenceCue, selectGuidanceCadence } from "@/lib/trainer/cadence-guidance"
+import { useEffect, useRef, useState } from "react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { TrainerChart } from "@/components/trainer-chart"
 import { TrainerConnectionCard } from "@/components/trainer-connection-card"
+import { DEFAULT_TEST_FTP, presetsForFtp, validTestFtp } from "@/lib/trainer/validation-presets"
+import { readBenchPrefs, writeBenchPrefs } from "@/lib/bench-prefs"
+import { Input } from "@/components/ui/input"
 import { TrainerManualControls } from "@/components/trainer-manual-controls"
 import { TrainerReadouts } from "@/components/trainer-readouts"
 import { TrainerRecordingCard } from "@/components/trainer-recording-card"
@@ -48,15 +52,41 @@ export interface TrainerPanelProps {
   /** bluetoothSupported && isSecureContext, from the page. */
   bluetoothAvailable: boolean
   /** The connected CycloWatt board, so the trainer chooser can reject it. */
+  getSrmCadence: () => number | null
+  boardReady: boolean
+  boardStreaming: boolean
+  onPrepareStreaming: () => Promise<void>
   boardDeviceId: string | null
 }
 
 /** Runner tick cadence while running; see the module comment on the other two sources. */
 const RUNNER_TICK_MS = 250
 
-export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanelProps) {
+export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, boardStreaming, onPrepareStreaming, getSrmCadence }: TrainerPanelProps) {
   /* The one collaborator that is not React, plus the mirror of its snapshot. */
   const { snapshot, controller } = useTrainerController({ boardDeviceId })
+  const [cadenceGuidance, setCadenceGuidance] = useState(true)
+  const combinedStartLock = useRef(false)
+  const [preparingStream, setPreparingStream] = useState(false)
+  const [streamStartError, setStreamStartError] = useState("")
+  const startWithStreaming = async () => {
+    if (combinedStartLock.current) return
+    combinedStartLock.current = true
+    setPreparingStream(true)
+    setStreamStartError("")
+    try {
+      await onPrepareStreaming()
+      if (!(await controller.startProtocol())) {
+        setStreamStartError("Trainer protocol did not start. CycloWatt CSV capture remains enabled; check the trainer error, then retry or stop streaming in Data Streaming.")
+      }
+    } catch (error) {
+      setStreamStartError(error instanceof Error ? error.message : "Could not start streaming.")
+    } finally {
+      combinedStartLock.current = false
+      setPreparingStream(false)
+    }
+  }
+
   const {
     capabilities,
     chartData,
@@ -84,7 +114,10 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     trainerReportedTargetW,
   } = snapshot
 
-  const [presets, setPresets] = useState<TrainerPreset[]>([])
+  const [storedPresets, setPresets] = useState<TrainerPreset[]>([])
+  const [testFtp, setTestFtp] = useState(DEFAULT_TEST_FTP)
+  const [ftpInput, setFtpInput] = useState(String(DEFAULT_TEST_FTP))
+  const presets = presetsForFtp(storedPresets, testFtp)
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null)
 
   /* ---------------------------------------------------------------- export */
@@ -110,6 +143,11 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
   // page is prerendered in node by the static export.
   useEffect(() => {
     setPresets(readPresets())
+    const savedFtp = readBenchPrefs().testFtp
+    if (typeof savedFtp === "number" && validTestFtp(savedFtp)) {
+      setTestFtp(savedFtp)
+      setFtpInput(String(savedFtp))
+    }
   }, [])
 
   function loadPreset(id: string): void {
@@ -124,7 +162,11 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
     const name = protocolName.trim()
     // No id: savePreset matches on the trimmed name, and handing it a built-in's
     // id would mint a user preset wearing that id.
-    const next = savePreset({ name: protocolName, steps })
+    if (presets.some((preset) => preset.builtIn && preset.name === name)) {
+      controller.setError("Choose a different name to save a custom copy of this built-in test.")
+      return
+    }
+    const next = presetsForFtp(savePreset({ name: protocolName, steps }), testFtp)
     setPresets(next)
 
     /*
@@ -186,6 +228,8 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
 
   /* ------------------------------------------------------------------ render */
 
+  const selectedManualGuide = presets.find((preset) => preset.id === selectedPresetId)?.manualGuide
+  const activeInstruction = mode === "protocol" && runner.status === "running" ? runner.protocol.steps[runner.stepIndex]?.instruction : undefined
   const powerRange = capabilities?.powerRange ?? DEFAULT_POWER_RANGE
   const resistanceRange = capabilities?.resistanceRange ?? DEFAULT_RESISTANCE_RANGE
   const features = capabilities?.features ?? null
@@ -205,9 +249,29 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
    */
   const heldRecording = !recording && sampleCount + eventCount > 0
   const protocolActive = runner.status === "running" || runner.status === "paused"
+  const ftpLocked = protocolActive || starting || preparingStream || recording || boardStreaming
+  const requestedFtp = ftpInput.trim() === "" ? NaN : Number(ftpInput)
+  const ftpValid = validTestFtp(requestedFtp)
+  function applyTestFtp() {
+    if (ftpLocked || !ftpValid) return
+    const next = presetsForFtp(storedPresets, requestedFtp)
+    const selected = next.find(preset => preset.id === selectedPresetId)
+    setTestFtp(requestedFtp)
+    writeBenchPrefs({ testFtp: requestedFtp })
+    if (selected?.builtIn && selected.id.startsWith("validation-")) {
+      controller.setProtocolName(selected.name)
+      controller.setSteps(selected.steps.map(step => ({ ...step })))
+    }
+  }
   const view = runnerView(runner, nowTick || Date.now())
   const stale = isStale(live?.receivedAtMs ?? null, nowTick)
   const currentTargetW = liveTargetW({ mode, runner, nowMs: nowTick || Date.now(), manualTargetSent, manualTargetW })
+
+  const cadenceTarget = mode === "protocol" && runner.status === "running"
+    ? runner.protocol.steps[runner.stepIndex]?.targetCadenceRpm : undefined
+  const srmCadence = getSrmCadence()
+  const guidanceCadence = selectGuidanceCadence({ srm: srmCadence, trainer: live?.cadenceRpm ?? null, trainerStale: stale, connected })
+  const cadenceMessage = cadenceCue(cadenceTarget, guidanceCadence)
 
   const targetLabelText = targetLabel({ mode, manualTargetSent, manualResistancePct, liveTargetW: currentTargetW })
   const stepLabelText = stepLabel({ mode, runnerStatus: runner.status, stepIndex: view.stepIndex, stepCount: view.stepCount })
@@ -229,6 +293,22 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         </Alert>
       )}
 
+      <div className="rounded-xl border border-gray-200 bg-white p-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="text-sm font-medium" htmlFor="test-rider-ftp">Rider FTP (W)
+            <Input id="test-rider-ftp" aria-label="Rider FTP in watts" type="number" min="1" max="2000" step="1"
+              className="mt-1 w-32" value={ftpInput} disabled={ftpLocked}
+              onChange={(event) => setFtpInput(event.target.value)} />
+          </label>
+          <Button onClick={applyTestFtp} disabled={ftpLocked || !ftpValid || requestedFtp === testFtp}>Apply FTP to tests</Button>
+          <span className="text-sm text-gray-600">Tests configured for {testFtp} W FTP</span>
+        </div>
+        <p className="mt-2 text-sm text-gray-600">Scales all core and extension watt targets, including T5 guides. Cadence and timings stay fixed. Applying reloads the selected built-in test; custom saved protocols keep their watts.</p>
+        {ftpLocked && <p className="mt-1 text-sm text-amber-700">Stop the protocol, streaming and recording before changing riders.</p>}
+        {!ftpValid && <p className="mt-1 text-sm text-red-700">Enter a whole-number FTP from 1 to 2000 W.</p>}
+        <p className="mt-1 text-xs text-gray-500">Remembered in this browser. Export recordings between riders; applying FTP does not clear recorded data.</p>
+      </div>
+
       <TrainerConnectionCard
         bluetoothAvailable={bluetoothAvailable}
         connecting={connecting}
@@ -248,6 +328,28 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         onTakeControl={() => void controller.takeControl()}
       />
 
+      <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input type="checkbox" checked={cadenceGuidance} onChange={(e) => setCadenceGuidance(e.target.checked)} />
+          Cadence guidance
+        </label>
+        {cadenceGuidance && <div className="mt-2" role="status">
+          <div className="text-2xl font-semibold">{cadenceMessage}</div>
+          {cadenceTarget !== undefined && <p className="text-sm mt-1">
+            Target {cadenceTarget} rpm · Current {guidanceCadence === null ? "—" : Math.round(guidanceCadence)} rpm
+            {guidanceCadence !== null && ` (${srmCadence !== null ? "SRM reference meter" : "trainer"})`} · Tolerance ±5 rpm
+          </p>}
+          <p className="text-xs text-gray-600 mt-1">Follow the cadence cue yourself; ERG controls power.</p>
+        </div>}
+      </div>
+
+      {activeInstruction && <div role="status" className="rounded-xl bg-amber-50 border border-amber-200 p-4 text-2xl font-semibold">{activeInstruction}</div>}
+      {selectedManualGuide && <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+        <h3 className="font-semibold">Manual test guide — {protocolName}</h3>
+        <p className="text-sm mt-1">ERG protocol start is unavailable for this test. Start CycloWatt streaming with CSV capture enabled in Data Streaming. Select Manual → Resistance here, start trainer recording, and follow these stages using an external timer.</p>
+        <ol className="list-decimal pl-6 mt-3 space-y-2 text-sm">{selectedManualGuide.map((instruction, i) => <li key={i}>{instruction}</li>)}</ol>
+      </div>}
+
       <TrainerReadouts
         powerW={live?.powerW ?? null}
         cadenceRpm={live?.cadenceRpm ?? null}
@@ -262,7 +364,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         <Button
           size="sm"
           variant={mode === "protocol" ? "default" : "outline"}
-          disabled={protocolActive || ergUnsupported}
+          disabled={protocolActive || starting || preparingStream || ergUnsupported}
           onClick={() => controller.changeMode("protocol")}
         >
           Protocol
@@ -270,7 +372,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
         <Button
           size="sm"
           variant={mode === "protocol" ? "outline" : "default"}
-          disabled={protocolActive}
+          disabled={protocolActive || starting || preparingStream}
           onClick={() => controller.changeMode("manual-power")}
         >
           Manual
@@ -295,21 +397,25 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
             onSavePreset={savePresetFromEditor}
             onDeletePreset={removePreset}
             powerRange={powerRange}
-            disabled={protocolActive}
+            disabled={protocolActive || starting || preparingStream}
           />
-          <TrainerRunCard
+          {streamStartError && <Alert variant="destructive"><AlertDescription>{streamStartError}</AlertDescription></Alert>}
+          {!selectedManualGuide && <TrainerRunCard
             connected={connected}
             protocolActive={protocolActive}
-            starting={starting}
+            starting={starting || preparingStream}
             steps={steps}
             runnerStatus={runner.status}
             nextStep={view.nextStep}
             onStart={() => void controller.startProtocol()}
+            onStartWithStreaming={() => void startWithStreaming()}
+            boardReady={boardReady}
+            boardStreaming={boardStreaming}
             onPause={() => controller.dispatchRunner({ type: "pause" })}
             onResume={() => void controller.resumeProtocol()}
             onSkip={() => controller.dispatchRunner({ type: "skip" })}
             onStop={() => controller.dispatchRunner({ type: "stop" })}
-          />
+          />}
         </>
       ) : (
         <TrainerManualControls

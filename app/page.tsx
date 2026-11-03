@@ -25,6 +25,7 @@ import { SMP_SERVICE_UUID } from "@/lib/smp/client"
 import { BOARD_NAME_PREFIXES, BOARD_NAME_PREFIX_HINT, firmwareVersionFromName, isBoardName } from "@/lib/device-name"
 import { applyDeviceName, nextDisplayName } from "@/lib/device-list"
 import { readGapDeviceName } from "@/lib/gap-name"
+import { ReferenceCadence } from "@/lib/cps/cadence"
 import { parseCyclingPowerMeasurement } from "@/lib/cps/measurement"
 import { CPS_SERVICE_UUID } from "@/lib/cps/protocol"
 import { CalibrationCard, type CalibrationReading } from "@/components/calibration-card"
@@ -528,6 +529,7 @@ export default function BluetoothDataLogger() {
   const lastPacketTimeRef = useRef<number>(Date.now())
 
   const refPowerValueRef = useRef<number>(0)
+  const refCadenceRef = useRef(new ReferenceCadence())
   const refCharacteristicRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null)
 
   // Holds the active notification handler so it can be removed on stop (prevents duplicate listeners)
@@ -716,6 +718,7 @@ export default function BluetoothDataLogger() {
       const measurementChar = await cpsService.getCharacteristic(CPS_MEASUREMENT_CHAR_UUID)
       console.log("✅ Found Cycling Power Measurement characteristic")
 
+      refCadenceRef.current.reset()
       measurementChar.addEventListener("characteristicvaluechanged", handleReferencePowerNotification)
       await measurementChar.startNotifications()
       console.log("📡 Reference power notifications started")
@@ -741,6 +744,7 @@ export default function BluetoothDataLogger() {
 
     const instantaneousPower = parseCyclingPowerMeasurement(dataView)
     if (instantaneousPower === null) return
+    refCadenceRef.current.update(dataView, Date.now())
     refPowerValueRef.current = instantaneousPower
     setLatestRefPower(instantaneousPower)
   }
@@ -751,6 +755,7 @@ export default function BluetoothDataLogger() {
     setRefDevice(null)
     refCharacteristicRef.current = null
     refPowerValueRef.current = 0
+    refCadenceRef.current.reset()
     setLatestRefPower(0)
   }
 
@@ -1222,6 +1227,7 @@ export default function BluetoothDataLogger() {
     const dataPoint = parsePacket(dataView, {
       timestamp: labelDate,
       referencePower: refPowerValueRef.current,
+      srmCadence: refCadenceRef.current.value(Date.now()),
       synchronization: serial.valueRef.current,
     })
     if (!dataPoint) return null
@@ -1243,7 +1249,7 @@ export default function BluetoothDataLogger() {
   }
 
   // Start data streaming
-  const startDataStreaming = async (charOverride?: BluetoothRemoteGATTCharacteristic) => {
+  const startDataStreaming = async (charOverride?: BluetoothRemoteGATTCharacteristic, preserveRecording = false) => {
     try {
       const activeCharacteristic = charOverride ?? characteristic
       if (!activeCharacteristic) {
@@ -1310,14 +1316,18 @@ export default function BluetoothDataLogger() {
       startTimeRef.current = Date.now()
       sampleCountRef.current = 0
       packetCountRef.current = 0
-      dataBufferRef.current = []
+      if (!preserveRecording) {
+        dataBufferRef.current = []
+        setRecordedCount(0)
+      }
       chartBufferRef.current = []
-      setRecordedCount(0)
 
       console.log("📡 Listening for 16x int32 data packets (64 bytes)...")
+      return true
     } catch (err) {
       console.error("❌ Failed to start streaming:", err)
       setError(`Failed to start streaming: ${err instanceof Error ? err.message : "Unknown error"}`)
+      return false
     }
   }
 
@@ -1833,6 +1843,16 @@ export default function BluetoothDataLogger() {
             <TrainerPanel
               bluetoothAvailable={bluetoothSupported && isSecureContext}
               boardDeviceId={device?.id ?? null}
+              getSrmCadence={() => refCadenceRef.current.value(Date.now())}
+              boardReady={isConnected && characteristic !== null}
+              boardStreaming={isStreaming}
+              onPrepareStreaming={async () => {
+                if (!isConnected || !characteristic) throw new Error("Connect the CycloWatt board first.")
+                setCsvCapture(true)
+                if (!isStreaming && !(await startDataStreaming(undefined, true))) {
+                  throw new Error("CycloWatt streaming could not start. The protocol was not started.")
+                }
+              }}
             />
           </TabsContent>
         </Tabs>

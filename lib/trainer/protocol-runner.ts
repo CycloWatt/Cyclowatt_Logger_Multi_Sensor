@@ -22,6 +22,8 @@
 import { MAX_STEPS } from "./presets"
 
 export interface ProtocolStep {
+  instruction?: string
+  targetCadenceRpm?: number
   targetWatts: number
   durationSeconds: number
 }

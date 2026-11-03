@@ -856,7 +856,7 @@ describe("takeControl", () => {
 describe("startProtocol", () => {
   it("starts the trainer and sends the first step target", async () => {
     const h = await connected()
-    await h.controller.startProtocol()
+    expect(await h.controller.startProtocol()).toBe(true)
     await flush()
 
     expect(h.calls).toEqual(["requestControl", "start", "setTargetPower:150"])
@@ -1228,4 +1228,12 @@ describe("snapshot and subscribe", () => {
     expect(afterFirst).toBeGreaterThan(0)
     expect(calls).toBe(afterFirst)
   })
+})
+
+it("reports a refused trainer start to combined-start callers", async () => {
+  const h = await connected()
+  h.fake.failNext("start", new Error("Trainer refused start"))
+  expect(await h.controller.startProtocol()).toBe(false)
+  expect(h.controller.snapshot.runner.status).toBe("idle")
+  expect(h.controller.snapshot.error).toContain("Trainer refused start")
 })

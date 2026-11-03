@@ -10,6 +10,7 @@
  * something to disagree with after the next release changes one.
  */
 
+import { DEFAULT_TEST_FTP, validationPresets } from "./validation-presets"
 import type { StringStore } from "../flash-history"
 
 /**
@@ -19,11 +20,14 @@ import type { StringStore } from "../flash-history"
  * one under TypeScript's structural typing, so callers can pass either.
  */
 export interface ProtocolStep {
+  instruction?: string
+  targetCadenceRpm?: number
   targetWatts: number
   durationSeconds: number
 }
 
 export interface TrainerPreset {
+  manualGuide?: string[]
   id: string
   name: string
   steps: ProtocolStep[]
@@ -63,6 +67,7 @@ function rampSteps(
  * persisted) and fixed at 0 so it never sorts ahead of a real user preset.
  */
 export const BUILT_IN_PRESETS: readonly TrainerPreset[] = [
+  ...validationPresets(DEFAULT_TEST_FTP),
   {
     id: "builtin-warmup",
     name: "Warm-up 10 min @ 100 W",
@@ -113,6 +118,7 @@ export function validateSteps(steps: readonly ProtocolStep[]): string | null {
     if (!Number.isFinite(step.targetWatts) || !Number.isFinite(step.durationSeconds)) {
       return "every step needs a real number for watts and duration"
     }
+    if (step.targetCadenceRpm !== undefined && (!Number.isFinite(step.targetCadenceRpm) || step.targetCadenceRpm <= 0)) return "target cadence must be a positive number or blank"
     if (step.targetWatts < 0) return "target watts cannot be negative"
     if (step.durationSeconds <= 0) return "step duration must be positive"
   }
@@ -142,6 +148,8 @@ function isStoredStep(value: unknown): value is ProtocolStep {
   if (typeof value !== "object" || value === null) return false
   const step = value as Record<string, unknown>
   return typeof step.targetWatts === "number" && typeof step.durationSeconds === "number"
+    && (step.instruction === undefined || typeof step.instruction === "string")
+    && (step.targetCadenceRpm === undefined || (typeof step.targetCadenceRpm === "number" && Number.isFinite(step.targetCadenceRpm) && step.targetCadenceRpm > 0))
 }
 
 /** Is `value` shaped enough to trust as a stored user TrainerPreset? */
