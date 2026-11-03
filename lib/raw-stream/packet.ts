@@ -41,6 +41,8 @@ export interface DataPoint {
   gyroY: number
   gyroZ: number
   power: number
+  /** Latest SRM cadence in RPM, null/absent when unavailable. */
+  srmCadence?: number | null
   referencePower: number
   synchronization: number
 }
@@ -49,6 +51,8 @@ export interface DataPoint {
 export interface PacketContext {
   /** When this page observed the packet; both `timestamp` and `timeLabel` come from it. */
   timestamp: Date
+  /** Latest SRM cadence in RPM, null/absent when unavailable. */
+  srmCadence?: number | null
   referencePower: number
   synchronization: number
 }
@@ -127,6 +131,7 @@ export function parseDataPacket(dataView: DataView, ctx: PacketContext): DataPoi
       gyroZ,
       power,
       referencePower: ctx.referencePower,
+      srmCadence: ctx.srmCadence ?? null,
       synchronization: ctx.synchronization,
     }
 

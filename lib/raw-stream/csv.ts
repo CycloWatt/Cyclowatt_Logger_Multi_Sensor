@@ -28,11 +28,12 @@
  *     logger's "button never pressed": the file loads, and any step that needs
  *     the sync clock fails loudly ("could not find a 0->non-zero transition")
  *     instead of anchoring on whatever the serial input happened to read.
- *   - Two columns have no logger counterpart and are appended LAST, so every
+ *   - Three columns have no logger counterpart and are appended LAST, so every
  *     logger column keeps its position and a reader that selects by name never
  *     sees them: `reference_power` (the trainer's power) and `serial_input`
  *     (the latest number from the Web Serial input, hooks/use-serial-sync.ts,
- *     kept as recorded). That name must not contain "synch": PAS's
+ *     kept as recorded), and `srm_cadence` (RPM from the reference meter,
+ *     blank when unavailable). That name must not contain "synch": PAS's
  *     find_column falls back to a SUBSTRING match when an exact name is
  *     missing, so a `synchronization` column could stand in for `synch`.
  *
@@ -75,6 +76,7 @@ const RAW_CSV_COLUMNS: readonly RawCsvColumn[] = [
   { header: "synch", cell: () => 0 }, // no sync at the dashboard - see the module comment
   { header: "reference_power", cell: (p) => p.referencePower },
   { header: "serial_input", cell: (p) => p.synchronization },
+  { header: "srm_cadence", cell: (p) => p.srmCadence ?? "" },
 ]
 
 export const RAW_CSV_HEADERS: readonly string[] = RAW_CSV_COLUMNS.map((column) => column.header)
