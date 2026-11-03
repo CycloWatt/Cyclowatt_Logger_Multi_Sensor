@@ -362,7 +362,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
         <Button
           size="sm"
           variant={mode === "protocol" ? "default" : "outline"}
-          disabled={protocolActive || ergUnsupported}
+          disabled={protocolActive || starting || preparingStream || ergUnsupported}
           onClick={() => controller.changeMode("protocol")}
         >
           Protocol
@@ -370,7 +370,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
         <Button
           size="sm"
           variant={mode === "protocol" ? "outline" : "default"}
-          disabled={protocolActive}
+          disabled={protocolActive || starting || preparingStream}
           onClick={() => controller.changeMode("manual-power")}
         >
           Manual
@@ -395,7 +395,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
             onSavePreset={savePresetFromEditor}
             onDeletePreset={removePreset}
             powerRange={powerRange}
-            disabled={protocolActive}
+            disabled={protocolActive || starting || preparingStream}
           />
           {streamStartError && <Alert variant="destructive"><AlertDescription>{streamStartError}</AlertDescription></Alert>}
           {!selectedManualGuide && <TrainerRunCard

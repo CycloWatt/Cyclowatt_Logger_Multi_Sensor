@@ -98,8 +98,9 @@ describe("parseDataPacket", () => {
     // Neither is on the wire: reference power comes from the CPS reference
     // trainer and synchronization from the serial line, and both are stamped
     // per packet so a capture can be aligned afterwards.
-    const point = parseDataPacket(packet({}), { timestamp: ctx.timestamp, referencePower: 217, synchronization: 9 })
+    const point = parseDataPacket(packet({}), { timestamp: ctx.timestamp, referencePower: 217, synchronization: 9, srmCadence: 91.5 })
     expect(point!.referencePower).toBe(217)
+    expect(point!.srmCadence).toBe(91.5)
     expect(point!.synchronization).toBe(9)
   })
 
@@ -155,6 +156,7 @@ describe("parseDataPacket", () => {
       gyroZ: 0,
       power: 7,
       referencePower: 150,
+      srmCadence: null,
       synchronization: 3,
     }
     expect(point).toEqual(expected)
