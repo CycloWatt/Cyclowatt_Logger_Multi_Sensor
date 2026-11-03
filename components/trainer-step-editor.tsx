@@ -274,6 +274,7 @@ export function TrainerStepEditor({
           </Button>
         </div>
 
+        {!selectedPreset?.manualGuide && <>
         <Table>
           <TableHeader>
             <TableRow>
@@ -281,6 +282,7 @@ export function TrainerStepEditor({
               <TableHead>Target (W)</TableHead>
               <TableHead>Duration (s)</TableHead>
               <TableHead>Cadence (rpm, optional)</TableHead>
+              <TableHead>Rider instruction</TableHead>
               <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
@@ -319,6 +321,9 @@ export function TrainerStepEditor({
                       ? { ...item, targetCadenceRpm: event.target.value === "" ? undefined : Number(event.target.value) }
                       : item))} />
                 </TableCell>
+                <TableCell><Input aria-label={`Step ${index + 1} instruction`} value={step.instruction ?? ""}
+                  disabled={disabled} className="h-8 min-w-48 text-xs" placeholder="Optional cue"
+                  onChange={(event) => commitStep(index, { instruction: event.target.value })} /></TableCell>
                 <TableCell className="text-right">
                   <div className="flex justify-end gap-1">
                     <Button
@@ -430,6 +435,7 @@ export function TrainerStepEditor({
 
           {rampOpen && rampMessage && <p className="mt-2 text-sm text-amber-600">{rampMessage}</p>}
         </div>
+        </>}
       </CardContent>
     </Card>
   )

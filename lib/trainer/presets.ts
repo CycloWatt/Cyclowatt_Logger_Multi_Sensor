@@ -10,6 +10,7 @@
  * something to disagree with after the next release changes one.
  */
 
+import { validationPresets } from "./validation-presets"
 import type { StringStore } from "../flash-history"
 
 /**
@@ -19,12 +20,14 @@ import type { StringStore } from "../flash-history"
  * one under TypeScript's structural typing, so callers can pass either.
  */
 export interface ProtocolStep {
+  instruction?: string
   targetCadenceRpm?: number
   targetWatts: number
   durationSeconds: number
 }
 
 export interface TrainerPreset {
+  manualGuide?: string[]
   id: string
   name: string
   steps: ProtocolStep[]
@@ -64,6 +67,7 @@ function rampSteps(
  * persisted) and fixed at 0 so it never sorts ahead of a real user preset.
  */
 export const BUILT_IN_PRESETS: readonly TrainerPreset[] = [
+  ...validationPresets(250),
   {
     id: "builtin-warmup",
     name: "Warm-up 10 min @ 100 W",

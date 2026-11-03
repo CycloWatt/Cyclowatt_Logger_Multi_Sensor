@@ -211,6 +211,8 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
 
   /* ------------------------------------------------------------------ render */
 
+  const selectedManualGuide = presets.find((preset) => preset.id === selectedPresetId)?.manualGuide
+  const activeInstruction = mode === "protocol" && runner.status === "running" ? runner.protocol.steps[runner.stepIndex]?.instruction : undefined
   const powerRange = capabilities?.powerRange ?? DEFAULT_POWER_RANGE
   const resistanceRange = capabilities?.resistanceRange ?? DEFAULT_RESISTANCE_RANGE
   const features = capabilities?.features ?? null
@@ -294,6 +296,13 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
         </div>}
       </div>
 
+      {activeInstruction && <div role="status" className="rounded-xl bg-amber-50 border border-amber-200 p-4 text-2xl font-semibold">{activeInstruction}</div>}
+      {selectedManualGuide && <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+        <h3 className="font-semibold">Manual test guide — {protocolName}</h3>
+        <p className="text-sm mt-1">ERG protocol start is unavailable for this test. Start CycloWatt streaming with CSV capture enabled in Data Streaming. Select Manual → Resistance here, start trainer recording, and follow these stages using an external timer.</p>
+        <ol className="list-decimal pl-6 mt-3 space-y-2 text-sm">{selectedManualGuide.map((instruction, i) => <li key={i}>{instruction}</li>)}</ol>
+      </div>}
+
       <TrainerReadouts
         powerW={live?.powerW ?? null}
         cadenceRpm={live?.cadenceRpm ?? null}
@@ -344,7 +353,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
             disabled={protocolActive}
           />
           {streamStartError && <Alert variant="destructive"><AlertDescription>{streamStartError}</AlertDescription></Alert>}
-          <TrainerRunCard
+          {!selectedManualGuide && <TrainerRunCard
             connected={connected}
             protocolActive={protocolActive}
             starting={starting || preparingStream}
@@ -359,7 +368,7 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
             onResume={() => void controller.resumeProtocol()}
             onSkip={() => controller.dispatchRunner({ type: "skip" })}
             onStop={() => controller.dispatchRunner({ type: "stop" })}
-          />
+          />}
         </>
       ) : (
         <TrainerManualControls
