@@ -1249,7 +1249,7 @@ export default function BluetoothDataLogger() {
   }
 
   // Start data streaming
-  const startDataStreaming = async (charOverride?: BluetoothRemoteGATTCharacteristic) => {
+  const startDataStreaming = async (charOverride?: BluetoothRemoteGATTCharacteristic, preserveRecording = false) => {
     try {
       const activeCharacteristic = charOverride ?? characteristic
       if (!activeCharacteristic) {
@@ -1316,14 +1316,18 @@ export default function BluetoothDataLogger() {
       startTimeRef.current = Date.now()
       sampleCountRef.current = 0
       packetCountRef.current = 0
-      dataBufferRef.current = []
+      if (!preserveRecording) {
+        dataBufferRef.current = []
+        setRecordedCount(0)
+      }
       chartBufferRef.current = []
-      setRecordedCount(0)
 
       console.log("📡 Listening for 16x int32 data packets (64 bytes)...")
+      return true
     } catch (err) {
       console.error("❌ Failed to start streaming:", err)
       setError(`Failed to start streaming: ${err instanceof Error ? err.message : "Unknown error"}`)
+      return false
     }
   }
 
@@ -1839,6 +1843,15 @@ export default function BluetoothDataLogger() {
             <TrainerPanel
               bluetoothAvailable={bluetoothSupported && isSecureContext}
               boardDeviceId={device?.id ?? null}
+              boardReady={isConnected && characteristic !== null}
+              boardStreaming={isStreaming}
+              onPrepareStreaming={async () => {
+                if (!isConnected || !characteristic) throw new Error("Connect the CycloWatt board first.")
+                setCsvCapture(true)
+                if (!isStreaming && !(await startDataStreaming(undefined, true))) {
+                  throw new Error("CycloWatt streaming could not start. The protocol was not started.")
+                }
+              }}
             />
           </TabsContent>
         </Tabs>

@@ -26,7 +26,7 @@
  * an unrelated action - this panel keeps its own (`snapshot.error`).
  */
 
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { TrainerChart } from "@/components/trainer-chart"
@@ -48,15 +48,37 @@ export interface TrainerPanelProps {
   /** bluetoothSupported && isSecureContext, from the page. */
   bluetoothAvailable: boolean
   /** The connected CycloWatt board, so the trainer chooser can reject it. */
+  boardReady: boolean
+  boardStreaming: boolean
+  onPrepareStreaming: () => Promise<void>
   boardDeviceId: string | null
 }
 
 /** Runner tick cadence while running; see the module comment on the other two sources. */
 const RUNNER_TICK_MS = 250
 
-export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanelProps) {
+export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, boardStreaming, onPrepareStreaming }: TrainerPanelProps) {
   /* The one collaborator that is not React, plus the mirror of its snapshot. */
   const { snapshot, controller } = useTrainerController({ boardDeviceId })
+  const combinedStartLock = useRef(false)
+  const [preparingStream, setPreparingStream] = useState(false)
+  const [streamStartError, setStreamStartError] = useState("")
+  const startWithStreaming = async () => {
+    if (combinedStartLock.current) return
+    combinedStartLock.current = true
+    setPreparingStream(true)
+    setStreamStartError("")
+    try {
+      await onPrepareStreaming()
+      await controller.startProtocol()
+    } catch (error) {
+      setStreamStartError(error instanceof Error ? error.message : "Could not start streaming.")
+    } finally {
+      combinedStartLock.current = false
+      setPreparingStream(false)
+    }
+  }
+
   const {
     capabilities,
     chartData,
@@ -297,14 +319,18 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId }: TrainerPanel
             powerRange={powerRange}
             disabled={protocolActive}
           />
+          {streamStartError && <Alert variant="destructive"><AlertDescription>{streamStartError}</AlertDescription></Alert>}
           <TrainerRunCard
             connected={connected}
             protocolActive={protocolActive}
-            starting={starting}
+            starting={starting || preparingStream}
             steps={steps}
             runnerStatus={runner.status}
             nextStep={view.nextStep}
             onStart={() => void controller.startProtocol()}
+            onStartWithStreaming={() => void startWithStreaming()}
+            boardReady={boardReady}
+            boardStreaming={boardStreaming}
             onPause={() => controller.dispatchRunner({ type: "pause" })}
             onResume={() => void controller.resumeProtocol()}
             onSkip={() => controller.dispatchRunner({ type: "skip" })}
