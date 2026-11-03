@@ -32,6 +32,9 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { TrainerChart } from "@/components/trainer-chart"
 import { TrainerConnectionCard } from "@/components/trainer-connection-card"
+import { DEFAULT_TEST_FTP, presetsForFtp, validTestFtp } from "@/lib/trainer/validation-presets"
+import { readBenchPrefs, writeBenchPrefs } from "@/lib/bench-prefs"
+import { Input } from "@/components/ui/input"
 import { TrainerManualControls } from "@/components/trainer-manual-controls"
 import { TrainerReadouts } from "@/components/trainer-readouts"
 import { TrainerRecordingCard } from "@/components/trainer-recording-card"
@@ -109,7 +112,10 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
     trainerReportedTargetW,
   } = snapshot
 
-  const [presets, setPresets] = useState<TrainerPreset[]>([])
+  const [storedPresets, setPresets] = useState<TrainerPreset[]>([])
+  const [testFtp, setTestFtp] = useState(DEFAULT_TEST_FTP)
+  const [ftpInput, setFtpInput] = useState(String(DEFAULT_TEST_FTP))
+  const presets = presetsForFtp(storedPresets, testFtp)
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null)
 
   /* ---------------------------------------------------------------- export */
@@ -135,6 +141,11 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
   // page is prerendered in node by the static export.
   useEffect(() => {
     setPresets(readPresets())
+    const savedFtp = readBenchPrefs().testFtp
+    if (typeof savedFtp === "number" && validTestFtp(savedFtp)) {
+      setTestFtp(savedFtp)
+      setFtpInput(String(savedFtp))
+    }
   }, [])
 
   function loadPreset(id: string): void {
@@ -149,7 +160,11 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
     const name = protocolName.trim()
     // No id: savePreset matches on the trimmed name, and handing it a built-in's
     // id would mint a user preset wearing that id.
-    const next = savePreset({ name: protocolName, steps })
+    if (presets.some((preset) => preset.builtIn && preset.name === name)) {
+      controller.setError("Choose a different name to save a custom copy of this built-in test.")
+      return
+    }
+    const next = presetsForFtp(savePreset({ name: protocolName, steps }), testFtp)
     setPresets(next)
 
     /*
@@ -232,6 +247,20 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
    */
   const heldRecording = !recording && sampleCount + eventCount > 0
   const protocolActive = runner.status === "running" || runner.status === "paused"
+  const ftpLocked = protocolActive || starting || preparingStream || recording || boardStreaming
+  const requestedFtp = ftpInput.trim() === "" ? NaN : Number(ftpInput)
+  const ftpValid = validTestFtp(requestedFtp)
+  function applyTestFtp() {
+    if (ftpLocked || !ftpValid) return
+    const next = presetsForFtp(storedPresets, requestedFtp)
+    const selected = next.find(preset => preset.id === selectedPresetId)
+    setTestFtp(requestedFtp)
+    writeBenchPrefs({ testFtp: requestedFtp })
+    if (selected?.builtIn && selected.id.startsWith("validation-")) {
+      controller.setProtocolName(selected.name)
+      controller.setSteps(selected.steps.map(step => ({ ...step })))
+    }
+  }
   const view = runnerView(runner, nowTick || Date.now())
   const stale = isStale(live?.receivedAtMs ?? null, nowTick)
   const currentTargetW = liveTargetW({ mode, runner, nowMs: nowTick || Date.now(), manualTargetSent, manualTargetW })
@@ -261,6 +290,22 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
           <AlertDescription>{error}</AlertDescription>
         </Alert>
       )}
+
+      <div className="rounded-xl border border-gray-200 bg-white p-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="text-sm font-medium" htmlFor="test-rider-ftp">Rider FTP (W)
+            <Input id="test-rider-ftp" aria-label="Rider FTP in watts" type="number" min="1" max="2000" step="1"
+              className="mt-1 w-32" value={ftpInput} disabled={ftpLocked}
+              onChange={(event) => setFtpInput(event.target.value)} />
+          </label>
+          <Button onClick={applyTestFtp} disabled={ftpLocked || !ftpValid || requestedFtp === testFtp}>Apply FTP to tests</Button>
+          <span className="text-sm text-gray-600">Tests configured for {testFtp} W FTP</span>
+        </div>
+        <p className="mt-2 text-sm text-gray-600">Scales all core and extension watt targets, including T5 guides. Cadence and timings stay fixed. Applying reloads the selected built-in test; custom saved protocols keep their watts.</p>
+        {ftpLocked && <p className="mt-1 text-sm text-amber-700">Stop the protocol, streaming and recording before changing riders.</p>}
+        {!ftpValid && <p className="mt-1 text-sm text-red-700">Enter a whole-number FTP from 1 to 2000 W.</p>}
+        <p className="mt-1 text-xs text-gray-500">Remembered in this browser. Export recordings between riders; applying FTP does not clear recorded data.</p>
+      </div>
 
       <TrainerConnectionCard
         bluetoothAvailable={bluetoothAvailable}

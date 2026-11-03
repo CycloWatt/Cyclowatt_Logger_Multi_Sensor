@@ -10,7 +10,7 @@
  * something to disagree with after the next release changes one.
  */
 
-import { validationPresets } from "./validation-presets"
+import { DEFAULT_TEST_FTP, validationPresets } from "./validation-presets"
 import type { StringStore } from "../flash-history"
 
 /**
@@ -67,7 +67,7 @@ function rampSteps(
  * persisted) and fixed at 0 so it never sorts ahead of a real user preset.
  */
 export const BUILT_IN_PRESETS: readonly TrainerPreset[] = [
-  ...validationPresets(250),
+  ...validationPresets(DEFAULT_TEST_FTP),
   {
     id: "builtin-warmup",
     name: "Warm-up 10 min @ 100 W",

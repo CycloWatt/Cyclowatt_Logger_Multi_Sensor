@@ -20,6 +20,7 @@ import type { StringStore } from "./flash-history"
 export const BENCH_PREFS_KEY = "cyclowatt-bench-prefs"
 
 export interface BenchPrefs {
+  testFtp?: number
   csvCaptureEnabled?: boolean
   useDeviceFilter?: boolean
 }

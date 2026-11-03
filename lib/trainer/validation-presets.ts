@@ -1,7 +1,21 @@
 import type { TrainerPreset, ProtocolStep } from "./presets"
 
+export const DEFAULT_TEST_FTP = 250
+
+export function validTestFtp(value: number): boolean {
+  return Number.isInteger(value) && value > 0 && value <= 2000
+}
+
+/** Rebuild only parameterized built-ins; saved custom protocols keep their watts. */
+export function presetsForFtp(presets: readonly TrainerPreset[], ftp: number): TrainerPreset[] {
+  const generated = validationPresets(ftp)
+  const byId = new Map(generated.map(preset => [preset.id, preset]))
+  return presets.map(preset => preset.builtIn ? byId.get(preset.id) ?? preset : preset)
+}
+
 /** Proposed measurement protocols, not fitness assessments. Whole-watt ERG targets. */
 export function validationPresets(ftp: number): TrainerPreset[] {
+  if (!validTestFtp(ftp)) throw new Error("FTP must be a whole number from 1 to 2000 W")
   const w = (fraction: number) => Math.round(ftp * fraction)
   const step = (fraction: number, rpm: number, instruction: string, seconds = 60): ProtocolStep =>
     ({ targetWatts: w(fraction), targetCadenceRpm: rpm, durationSeconds: seconds, instruction })
