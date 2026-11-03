@@ -29,7 +29,13 @@ export class ReferenceCadence {
     const current = { revolutions: view.getUint16(offset, true), time: view.getUint16(offset + 2, true) }
     const previous = this.previous
     this.previous = current
-    if (!previous) return null
+    // After a complete event-clock period, modulo arithmetic cannot tell how
+    // many wraps elapsed. Reacquire two events rather than inventing an RPM.
+    if (!previous || now - this.lastMovement >= 64_000) {
+      this.rpm = null
+      this.lastMovement = now
+      return null
+    }
     const revolutions = (current.revolutions - previous.revolutions + 65536) % 65536
     const elapsed = (current.time - previous.time + 65536) % 65536
     if (revolutions && elapsed) {

@@ -36,3 +36,11 @@ describe("ReferenceCadence", () => {
     expect(cadence.update(new DataView(new Uint8Array([32, 0, 0, 0, 1]).buffer), 1000)).toBeNull()
   })
 })
+
+it("reacquires a baseline after a full event-clock period without movement", () => {
+  const cadence = new ReferenceCadence()
+  cadence.update(packet(1, 100), 1000)
+  expect(cadence.update(packet(2, 1124), 2000)).toBe(60)
+  expect(cadence.update(packet(3, 2148), 67000)).toBeNull()
+  expect(cadence.update(packet(4, 3172), 68000)).toBe(60)
+})
