@@ -30,6 +30,7 @@ import { cadenceCue, selectGuidanceCadence } from "@/lib/trainer/cadence-guidanc
 import { useEffect, useRef, useState } from "react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import { TrainerStageAlert } from "@/components/trainer-stage-alert"
 import { TrainerChart } from "@/components/trainer-chart"
 import { TrainerConnectionCard } from "@/components/trainer-connection-card"
 import { DEFAULT_TEST_FTP, presetsForFtp, validTestFtp } from "@/lib/trainer/validation-presets"
@@ -327,6 +328,8 @@ export function TrainerPanel({ bluetoothAvailable, boardDeviceId, boardReady, bo
         onDisconnect={() => void controller.disconnect()}
         onTakeControl={() => void controller.takeControl()}
       />
+
+      {mode === "protocol" && !selectedManualGuide && <TrainerStageAlert runner={runner} />}
 
       <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
         <label className="flex items-center gap-2 text-sm font-medium">
