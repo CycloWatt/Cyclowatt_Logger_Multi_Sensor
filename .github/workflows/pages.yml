@@ -35,7 +35,7 @@ jobs:
         with:
           # Keep in step with the other workflow and the @types/node major in
           # package.json - ci.yml checks that the two agree.
-          node-version: 24
+          node-version: 26
           cache: npm
 
       - run: npm ci

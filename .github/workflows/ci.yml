@@ -32,7 +32,7 @@ jobs:
         with:
           # Keep in step with pages.yml and the @types/node major in
           # package.json - the step after `npm ci` enforces the latter.
-          node-version: 24
+          node-version: 26
           cache: npm
 
       - run: npm ci
