@@ -22,3 +22,18 @@ updates:
     # @types/node majors are deliberately NOT ignored: that PR is the only
     # notice of a new Node line. ci.yml fails it until node-version in the
     # workflows is bumped along with it.
+
+  # Workflow actions were not covered, so ci.yml and pages.yml fell several
+  # majors behind (checkout, setup-node, the three Pages actions). Same shape
+  # as logger-fw and power-analysis-suite: one grouped weekly PR for all actions.
+  - package-ecosystem: "github-actions"
+    # "/" makes Dependabot scan all workflows under .github/workflows.
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
